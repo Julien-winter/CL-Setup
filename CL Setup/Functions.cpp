@@ -1,5 +1,6 @@
 #include "Functions.h"
 
+
 // All Checks namespace functions
 void Checks::checkWindowsDefender()
 {
