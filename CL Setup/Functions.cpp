@@ -13,7 +13,7 @@ namespace Helper {
     std::mutex g_resultsMutex;
     std::string g_repoUrl = "Julien-winter/CL-Setup";
     std::string g_appName = "CL-Setup";
-    std::string g_appVersion = "1.1";
+    std::string g_appVersion = "1.1.1";
 }
 
 void Helper::recordResult(const std::string& check, const std::string& status, const std::string& message)
@@ -406,19 +406,19 @@ void Checks::checkWindowsDefender()
     if (scm == NULL) {
         DWORD err = GetLastError();
         Helper::printError("- Failed to check Windows Defender (Error 1, GLE=" + std::to_string(err) + ")");
-        Helper::recordResult("Windows Defender", "FAIL", "SCM open failed GLE=" + std::to_string(err));
-        Sleep(1000);
-        Helper::runSystemCommand("start https://www.sordum.org/9480/defender-control-v2-1/");
+        Helper::recordResult("Windows Defender", "FAIL", "SCM open failed");
         return;
     }
 
     SC_HANDLE service = OpenService(scm, "WinDefend", SERVICE_QUERY_STATUS);
     if (service == NULL) {
-        DWORD err = GetLastError();
-        Helper::printError("- Failed to check Windows Defender (Error 2, GLE=" + std::to_string(err) + ")");
-        Helper::recordResult("Windows Defender", "FAIL", "OpenService failed GLE=" + std::to_string(err));
-        Sleep(1000);
-        Helper::runSystemCommand("start https://www.sordum.org/9480/defender-control-v2-1/");
+        if (GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST) {
+            Helper::recordResult("Windows Defender", "OK", "Service removed");
+        }
+        else {
+            Helper::printError("- Failed to check Windows Defender (Error 2, GLE=" + std::to_string(GetLastError()) + ")");
+            Helper::recordResult("Windows Defender", "FAIL", "OpenService failed");
+        }
         CloseServiceHandle(scm);
         return;
     }
@@ -426,32 +426,66 @@ void Checks::checkWindowsDefender()
     SERVICE_STATUS_PROCESS status;
     DWORD bytesNeeded;
     if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, (LPBYTE)&status, sizeof(status), &bytesNeeded)) {
-        DWORD err = GetLastError();
-        Helper::printError("- Failed to check Windows Defender (Error 3, GLE=" + std::to_string(err) + ")");
-        Helper::recordResult("Windows Defender", "FAIL", "QueryService failed GLE=" + std::to_string(err));
-        Sleep(1000);
-        Helper::runSystemCommand("start https://www.sordum.org/9480/defender-control-v2-1/");
+        Helper::printError("- Failed to check Windows Defender (Error 3, GLE=" + std::to_string(GetLastError()) + ")");
+        Helper::recordResult("Windows Defender", "FAIL", "QueryService failed");
         CloseServiceHandle(service);
         CloseServiceHandle(scm);
         return;
     }
 
-    if (status.dwCurrentState == SERVICE_RUNNING) {
-        Helper::printError("- Windows Defender is enabled");
-        Helper::recordResult("Windows Defender", "FAIL", "Enabled");
-        Sleep(1000);
-        Helper::runSystemCommand("start https://www.sordum.org/9480/defender-control-v2-1/");
+    if (status.dwCurrentState != SERVICE_RUNNING && status.dwCurrentState != SERVICE_START_PENDING) {
         CloseServiceHandle(service);
         CloseServiceHandle(scm);
-        return;
-    }
-    else {
         Helper::printSuccess("- Windows Defender is disabled", false);
         Helper::recordResult("Windows Defender", "OK", "Disabled");
-        CloseServiceHandle(service);
-        CloseServiceHandle(scm);
         return;
     }
+
+    // Try to stop + disable
+    CloseServiceHandle(service);
+    service = OpenService(scm, "WinDefend", SERVICE_CHANGE_CONFIG | SERVICE_STOP | SERVICE_QUERY_STATUS);
+    CloseServiceHandle(scm);
+
+    bool serviceStopped = false;
+    if (service != NULL) {
+        SERVICE_STATUS stopStatus;
+        if (ControlService(service, SERVICE_CONTROL_STOP, &stopStatus)) {
+            Sleep(500);
+            serviceStopped = true;
+        }
+        if (ChangeServiceConfig(service, SERVICE_NO_CHANGE, SERVICE_DISABLED, SERVICE_NO_CHANGE,
+            NULL, NULL, NULL, NULL, NULL, NULL, NULL)) {
+            serviceStopped = true;
+        }
+        CloseServiceHandle(service);
+    }
+
+    // Always set registry policies
+    HKEY hKey; DWORD val = 1;
+    RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SOFTWARE\\Policies\\Microsoft\\Windows Defender",
+        0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL);
+    RegSetValueEx(hKey, "DisableAntiSpyware", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+    RegCloseKey(hKey);
+
+    RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection",
+        0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL);
+    RegSetValueEx(hKey, "DisableRealtimeMonitoring", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+    RegSetValueEx(hKey, "DisableBehaviorMonitoring", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+    RegSetValueEx(hKey, "DisableOnAccessProtection", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+    RegSetValueEx(hKey, "DisableScanOnRealtimeEnable", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+    RegCloseKey(hKey);
+
+    if (serviceStopped) {
+        Helper::printSuccess("- Windows Defender disabled (service + policy)", true);
+        Helper::recordResult("Windows Defender", "OK", "Disabled (changed)");
+    }
+    else {
+        Helper::printSuccess("- Windows Defender policies set (restart required)", true);
+        Helper::recordResult("Windows Defender", "OK", "Policy set, restart needed");
+        Sleep(500);
+        Helper::runSystemCommand("start https://www.sordum.org/9480/defender-control-v2-1/");
+    }
+    Helper::restartRequired = true;
 }
 void Checks::check3rdPartyAntiVirus()
 {
@@ -462,41 +496,79 @@ void Checks::check3rdPartyAntiVirus()
     std::FILE* pipe = _popen(command.c_str(), "r");
     if (!pipe) {
         DWORD err = GetLastError();
-        Helper::printError("- Failed to check for 3rd party Anti-Viruses, manually check and uninstall (Error 4, GLE=" + std::to_string(err) + ")");
-        Helper::recordResult("3rd Party AV", "FAIL", "WMIC failed GLE=" + std::to_string(err));
+        Helper::printError("- Failed to check for 3rd party Anti-Viruses (Error 4, GLE=" + std::to_string(err) + ")");
+        Helper::recordResult("3rd Party AV", "FAIL", "WMIC failed");
         return;
     }
 
-    char buffer[128];
-    std::string result;
-    while (std::fgets(buffer, 128, pipe) != NULL) {
-        result += buffer;
-    }
+    char buffer[128]; std::string wmicOutput;
+    while (std::fgets(buffer, 128, pipe) != NULL) wmicOutput += buffer;
     _pclose(pipe);
 
-    std::size_t pos = result.find("displayName");
-    while ((pos = result.find("\n")) != std::string::npos) {
-        std::string antivirus = result.substr(0, pos);
-        if (antivirus.find("Windows Defender") == std::string::npos && antivirus.size() > 12) {
-            antivirus = antivirus.substr(12);
-            antivirus.erase(std::remove(antivirus.begin(), antivirus.end(), '\n'), antivirus.end());
-            antivirus.erase(std::remove(antivirus.begin(), antivirus.end(), '\r'), antivirus.end());
-            antivirus.erase(std::remove(antivirus.begin(), antivirus.end(), '\b'), antivirus.end());
-            if (!antivirusList.empty()) antivirusList += ", ";
-            antivirusList += antivirus;
+    std::vector<std::string> detectedAVs;
+    std::size_t pos;
+    while ((pos = wmicOutput.find("\n")) != std::string::npos) {
+        std::string av = wmicOutput.substr(0, pos);
+        if (av.find("Windows Defender") == std::string::npos && av.size() > 12) {
+            av = av.substr(12);
+            av.erase(std::remove(av.begin(), av.end(), '\n'), av.end());
+            av.erase(std::remove(av.begin(), av.end(), '\r'), av.end());
+            av.erase(std::remove(av.begin(), av.end(), '\b'), av.end());
+            detectedAVs.push_back(av);
         }
-        if (pos + 1 < result.size()) result = result.substr(pos + 1);
+        if (pos + 1 < wmicOutput.size()) wmicOutput = wmicOutput.substr(pos + 1);
         else break;
     }
 
-    if (!antivirusList.empty()) {
-        Helper::printError("- A 3rd party Anti-Virus is installed, please uninstall or disable it (" + antivirusList + ")");
-        Helper::recordResult("3rd Party AV", "FAIL", "Found: " + antivirusList);
+    if (detectedAVs.empty()) {
+        Helper::printSuccess("- No 3rd party Anti-Virus was detected", false);
+        Helper::recordResult("3rd Party AV", "OK", "None detected");
         return;
     }
 
-    Helper::printSuccess("- No 3rd party Anti-Virus was detected", false);
-    Helper::recordResult("3rd Party AV", "OK", "None detected");
+    std::string avList;
+    for (auto& av : detectedAVs) { if (!avList.empty()) avList += ", "; avList += av; }
+
+    bool anyRemoved = false;
+    for (auto& av : detectedAVs) {
+        // Try to find uninstall string in registry
+        HKEY hKey;
+        if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+            0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+            DWORD idx = 0; char subkeyName[256]; DWORD subkeyNameSize = sizeof(subkeyName);
+            while (RegEnumKeyEx(hKey, idx, subkeyName, &subkeyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                HKEY hSubkey;
+                if (RegOpenKeyEx(hKey, subkeyName, 0, KEY_READ, &hSubkey) == ERROR_SUCCESS) {
+                    char dn[256]; DWORD dnSize = sizeof(dn);
+                    if (RegQueryValueEx(hSubkey, "DisplayName", NULL, NULL, (LPBYTE)dn, &dnSize) == ERROR_SUCCESS) {
+                        std::string displayName(dn);
+                        if (displayName.find(av) != std::string::npos || av.find(displayName) != std::string::npos) {
+                            char uninstall[512]; DWORD usSize = sizeof(uninstall);
+                            if (RegQueryValueEx(hSubkey, "UninstallString", NULL, NULL, (LPBYTE)uninstall, &usSize) == ERROR_SUCCESS) {
+                                std::string uninstallCmd(uninstall);
+                                uninstallCmd += " /S /quiet /norestart";
+                                Helper::runSystemCommand(uninstallCmd.c_str());
+                                Sleep(1000);
+                                anyRemoved = true;
+                            }
+                        }
+                    }
+                    RegCloseKey(hSubkey);
+                }
+                subkeyNameSize = sizeof(subkeyName); ++idx;
+            }
+            RegCloseKey(hKey);
+        }
+    }
+
+    if (anyRemoved) {
+        Helper::printSuccess("- Attempted to remove 3rd party AV (" + avList + ")", true);
+        Helper::recordResult("3rd Party AV", "OK", "Uninstall attempted: " + avList);
+    }
+    else {
+        Helper::printError("- 3rd party Anti-Virus detected, please uninstall manually (" + avList + ")");
+        Helper::recordResult("3rd Party AV", "FAIL", "Found: " + avList);
+    }
 }
 void Checks::checkCPUV()
 {
