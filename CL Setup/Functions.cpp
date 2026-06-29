@@ -8,6 +8,7 @@ namespace Helper {
     std::mutex logMutex;
     std::ofstream logFile;
     bool logEnabled = false;
+    std::string g_logPath;
     CLIConfig cliConfig;
     std::vector<CheckResult> g_results;
     std::mutex g_resultsMutex;
@@ -20,6 +21,7 @@ void Helper::recordResult(const std::string& check, const std::string& status, c
 {
     std::lock_guard<std::mutex> lock(g_resultsMutex);
     g_results.push_back({check, status, message});
+    logWrite("  [" + status + "] " + check + " - " + message);
 }
 
 std::string Helper::escapeJSON(const std::string& s)
@@ -148,10 +150,9 @@ void Helper::showHelp()
     std::cout << "  --help              Show this help message\n";
     std::cout << "  --headless          Run without user interaction\n";
     std::cout << "  --quiet             Only show errors and warnings\n";
-    std::cout << "  --log               Write output to %TEMP%\\" << g_appName << ".log\n";
     std::cout << "  --export FILE       Export results as JSON to FILE\n";
-    std::cout << "  --skip N[,M,...]    Skip specific checks by number (1-19)\n";
-    std::cout << "  --only N[,M,...]    Run only specific checks by number (1-19)\n\n";
+    std::cout << "  --skip N[,M,...]    Skip specific checks by number (1-22)\n";
+    std::cout << "  --only N[,M,...]    Run only specific checks by number (1-22)\n\n";
     std::cout << "Check Numbers:\n";
     std::cout << "  1=WindowsDefender 2=3rdPartyAV 3=SecureBoot 4=CPU-V 5=RiotVanguard\n";
     std::cout << "  6=VCRedist 7=Chrome 8=ChromeProtection 9=TimeSync 10=Winver\n";
@@ -175,9 +176,6 @@ CLIConfig Helper::parseCLI(int argc, char* argv[])
         else if (arg == "--quiet") {
             config.quiet = true;
         }
-        else if (arg == "--log") {
-            config.logToFile = true;
-        }
         else if (arg == "--skip" && i + 1 < argc) {
             std::string val(argv[++i]);
             std::stringstream ss(val);
@@ -196,13 +194,11 @@ CLIConfig Helper::parseCLI(int argc, char* argv[])
                 catch (...) {}
             }
         }
-        else if (arg == "--config" && i + 1 < argc) {
-            config.configPath = argv[++i];
-        }
         else if (arg == "--export" && i + 1 < argc) {
             config.exportPath = argv[++i];
         }
     }
+
     return config;
 }
 
@@ -234,16 +230,28 @@ bool Helper::isAdmin()
 
 void Helper::initLogging()
 {
-    if (!cliConfig.logToFile && !cliConfig.headless) return;
-
     wchar_t tempPath[MAX_PATH];
     GetTempPathW(MAX_PATH, tempPath);
-    std::wstring logPath = std::wstring(tempPath) + L"cl-setup.log";
+    std::wstring dir = std::wstring(tempPath) + L"CL-Setup";
+    CreateDirectoryW(dir.c_str(), NULL);
+
+    auto now = std::chrono::system_clock::now();
+    auto time = std::chrono::system_clock::to_time_t(now);
+    std::tm tm;
+    localtime_s(&tm, &time);
+    char filename[64];
+    snprintf(filename, sizeof(filename), "setup-%04d-%02d-%02d-%02d%02d.log",
+        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
+
+    std::wstring logPath = dir + L"\\" + std::wstring(filename, filename + strlen(filename));
+    int len = WideCharToMultiByte(CP_UTF8, 0, logPath.c_str(), -1, NULL, 0, NULL, NULL);
+    g_logPath.resize(len - 1);
+    WideCharToMultiByte(CP_UTF8, 0, logPath.c_str(), -1, &g_logPath[0], len, NULL, NULL);
 
     logFile.open(logPath, std::ios::out | std::ios::app);
     if (logFile.is_open()) {
         logEnabled = true;
-        logWrite("=== " + g_appName + " started at " + getTimestampISO() + " ===");
+        logWrite("=== " + g_appName + " v" + g_appVersion + " started at " + getTimestampISO() + " ===");
     }
 }
 
@@ -1217,7 +1225,6 @@ void Helper::printSuccess(const std::string& message, bool changed)
     std::cout << message;
     if (changed) { Color::setForegroundColor(Color::Yellow); std::cout << " (CHANGED)"; }
     std::cout << std::endl;
-    logWrite("[+] " + message + (changed ? " (CHANGED)" : ""));
 }
 void Helper::printConcern(const std::string& message)
 {
@@ -1226,7 +1233,6 @@ void Helper::printConcern(const std::string& message)
     std::cout << "[-] ";
     Color::setForegroundColor(Color::White);
     std::cout << message << std::endl;
-    logWrite("[-] " + message);
 }
 void Helper::printError(const std::string& message)
 {
@@ -1235,7 +1241,6 @@ void Helper::printError(const std::string& message)
     std::cout << "[X] ";
     Color::setForegroundColor(Color::White);
     std::cout << message << std::endl;
-    logWrite("[X] " + message);
 }
 void Helper::runSystemCommand(const char* command)
 {

@@ -164,7 +164,7 @@ int main(int argc, char* argv[])
     Helper::closeLogging();
 
     if (!Helper::cliConfig.headless) {
-        std::cout << "\nPress any key to exit...";
+        std::cout << "Press any key to exit...";
         std::cin.get();
     }
 
