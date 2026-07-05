@@ -145,52 +145,69 @@ int main(int argc, char* argv[])
     Color::setForegroundColor(Color::Cyan);
     std::cout << "Initial checks completed. No changes have been applied yet.\n";
 
+    bool changesApplied = false;
+
     if (!Helper::pendingChanges.empty()) {
         std::cout << "\nPending changes:\n";
         for (auto& pc : Helper::pendingChanges) {
             std::cout << " - " << pc << "\n";
         }
+        std::cout << "\n";
+
+        bool shouldApply = true;
+        if (!Helper::cliConfig.headless) {
+            int result = MessageBoxA(NULL, "Do you want to apply the pending changes?", "CL-Setup",
+                MB_YESNO | MB_ICONQUESTION | MB_TOPMOST);
+            if (result == IDNO) {
+                shouldApply = false;
+                Color::setForegroundColor(Color::Cyan);
+                std::cout << "Changes skipped by user.\n" << std::endl;
+            }
+        }
+
+        if (shouldApply) {
+            Color::setForegroundColor(Color::Cyan);
+            std::cout << "Applying approved changes...\n";
+            Color::setForegroundColor(Color::LightGray);
+            std::cout << "-----------------------------------------------------------------\n";
+
+            Helper::g_phase = 2;
+            Helper::applyPendingChanges();
+            changesApplied = true;
+        }
     }
 
-    std::cout << "\n";
-    Color::setForegroundColor(Color::Cyan);
-    std::cout << "Applying approved changes...\n";
-    Color::setForegroundColor(Color::LightGray);
-    std::cout << "-----------------------------------------------------------------\n";
+    if (changesApplied) {
+        Helper::g_phase = 3;
 
-    Helper::g_phase = 2;
+        std::vector<std::thread> parallelChecks2;
 
-    Helper::applyPendingChanges();
+        if (!Helper::isCheckSkipped(1)) {
+            parallelChecks2.emplace_back([]() { Checks::checkWindowsDefender(); });
+        }
+        if (!Helper::isCheckSkipped(2)) {
+            parallelChecks2.emplace_back([]() { Checks::check3rdPartyAntiVirus(); });
+        }
+        if (!Helper::isCheckSkipped(7)) {
+            parallelChecks2.emplace_back([]() { Checks::isChromeInstalled(); });
+        }
 
-    Helper::g_phase = 3;
+        for (auto& t : parallelChecks2) t.join();
+        parallelChecks2.clear();
 
-    std::vector<std::thread> parallelChecks2;
-
-    if (!Helper::isCheckSkipped(1)) {
-        parallelChecks2.emplace_back([]() { Checks::checkWindowsDefender(); });
+        if (!Helper::isCheckSkipped(3)) Checks::checkSecureBoot();
+        if (!Helper::isCheckSkipped(4)) Checks::checkCPUV();
+        if (!Helper::isCheckSkipped(5)) Checks::checkRiotVanguard();
+        if (!Helper::isCheckSkipped(6)) Checks::checkVCRedist();
+        if (!Helper::isCheckSkipped(8)) Checks::disableChromeProtection();
+        if (!Helper::isCheckSkipped(12)) Checks::checkFastBoot();
+        if (!Helper::isCheckSkipped(13)) Checks::checkExploitProtection();
+        if (!Helper::isCheckSkipped(14)) Checks::checkSmartScreen();
+        if (!Helper::isCheckSkipped(15)) Checks::checkGameBar();
+        if (!Helper::isCheckSkipped(17)) Checks::checkCoreIsolation();
+        if (!Helper::isCheckSkipped(18)) Checks::checkDMAProtection();
+        if (!Helper::isCheckSkipped(24)) Checks::checkSecurityMitigations();
     }
-    if (!Helper::isCheckSkipped(2)) {
-        parallelChecks2.emplace_back([]() { Checks::check3rdPartyAntiVirus(); });
-    }
-    if (!Helper::isCheckSkipped(7)) {
-        parallelChecks2.emplace_back([]() { Checks::isChromeInstalled(); });
-    }
-
-    for (auto& t : parallelChecks2) t.join();
-    parallelChecks2.clear();
-
-    if (!Helper::isCheckSkipped(3)) Checks::checkSecureBoot();
-    if (!Helper::isCheckSkipped(4)) Checks::checkCPUV();
-    if (!Helper::isCheckSkipped(5)) Checks::checkRiotVanguard();
-    if (!Helper::isCheckSkipped(6)) Checks::checkVCRedist();
-    if (!Helper::isCheckSkipped(8)) Checks::disableChromeProtection();
-    if (!Helper::isCheckSkipped(12)) Checks::checkFastBoot();
-    if (!Helper::isCheckSkipped(13)) Checks::checkExploitProtection();
-    if (!Helper::isCheckSkipped(14)) Checks::checkSmartScreen();
-    if (!Helper::isCheckSkipped(15)) Checks::checkGameBar();
-    if (!Helper::isCheckSkipped(17)) Checks::checkCoreIsolation();
-    if (!Helper::isCheckSkipped(18)) Checks::checkDMAProtection();
-    if (!Helper::isCheckSkipped(24)) Checks::checkSecurityMitigations();
 
     Color::setForegroundColor(Color::LightGray);
     std::cout << "-----------------------------------------------------------------\n";

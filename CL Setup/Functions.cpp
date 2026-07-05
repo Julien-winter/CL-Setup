@@ -535,8 +535,12 @@ void Checks::checkSecurityMitigations()
 
     std::string hvLaunchOutput = Helper::runSystemCommandWithOutput(
         "powershell -Command \"(Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\VirtualizationSecurity' -Name 'LaunchType' -ErrorAction SilentlyContinue).LaunchType\"", 5000);
+    while (!hvLaunchOutput.empty() && (hvLaunchOutput.back() == '\r' || hvLaunchOutput.back() == '\n' || hvLaunchOutput.back() == ' '))
+        hvLaunchOutput.pop_back();
     if (hvLaunchOutput.find("off") != std::string::npos || hvLaunchOutput.find("Off") != std::string::npos) {
         Helper::printSuccess("- Hypervisor launch is already off", false);
+    } else if (hvLaunchOutput.empty()) {
+        Helper::printConcern("- Hypervisor launch type not found (likely off by default)");
     } else {
         Helper::printConcern("- Hypervisor launch=" + hvLaunchOutput);
     }
