@@ -76,14 +76,18 @@ namespace Checks {
     void checkWindowsDefender();
     void check3rdPartyAntiVirus();
     void checkCPUV();
+    void checkRiotVanguard();
+    void checkVCRedist();
     void uninstallRiotVanguard();
     void installVCRedist();
     void checkSecureBoot();
     void isChromeInstalled();
+    void checkTimeSync();
     void syncWindowsTime();
     void disableChromeProtection();
 
     void checkWinver();
+    void checkSymbols();
     void deleteSymbols();
     void checkFastBoot();
     void checkExploitProtection();
@@ -104,6 +108,8 @@ namespace Helper {
     extern bool restartRequired;
     extern std::atomic<bool> vcComplete;
     extern int vcCheckSleepTimes;
+    extern int g_phase;
+    extern std::vector<std::string> pendingChanges;
 
     extern std::mutex consoleMutex;
     extern std::mutex logMutex;
@@ -140,6 +146,7 @@ namespace Helper {
     std::string escapeJSON(const std::string& s);
     std::string getTimestampISO();
     std::string fetchURL(const std::wstring& url);
+    void applyPendingChanges();
 }
 namespace Color {
     void setBackgroundColor(const RGBColor& aColor);

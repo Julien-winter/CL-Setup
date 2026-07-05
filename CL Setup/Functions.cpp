@@ -4,6 +4,8 @@ namespace Helper {
     bool restartRequired = false;
     std::atomic<bool> vcComplete{false};
     int vcCheckSleepTimes = 0;
+    int g_phase = 1;
+    std::vector<std::string> pendingChanges;
     std::mutex consoleMutex;
     std::mutex logMutex;
     std::ofstream logFile;
@@ -463,145 +465,99 @@ void Checks::checkSecurityMitigations()
 {
     SetConsoleTitleA("Checking Security Mitigations");
 
-    std::vector<std::string> settings;
-    std::vector<std::string> pendingChanges;
-    bool allGood = true;
-
     auto readRegistry = [](const char* subkey, const char* valueName) -> std::pair<bool, DWORD> {
         DWORD val = 0;
         bool found = Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE, subkey, valueName, &val);
         return {found, val};
     };
 
-    auto addSetting = [&](const std::string& name, bool found, DWORD value, DWORD expected) {
-        if (!found) {
-            settings.push_back(name + "=missing");
-            return;
-        }
-        settings.push_back(name + "=" + std::to_string(value));
-        if (value != expected) {
-            allGood = false;
-        }
-    };
-
     auto [vbsFound, vbsVal] = readRegistry(
         "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard", "EnableVirtualizationBasedSecurity");
-    addSetting("EnableVirtualizationBasedSecurity", vbsFound, vbsVal, 0);
+    if (vbsFound && vbsVal == 0) {
+        Helper::printSuccess("- EnableVirtualizationBasedSecurity already set to 0", false);
+    } else {
+        Helper::printConcern("- EnableVirtualizationBasedSecurity=" + (vbsFound ? std::to_string(vbsVal) : "missing"));
+    }
 
     auto [rpsfFound, rpsfVal] = readRegistry(
         "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard", "RequirePlatformSecurityFeatures");
-    addSetting("RequirePlatformSecurityFeatures", rpsfFound, rpsfVal, 0);
-
-    auto [hvciFound, hvciVal] = readRegistry(
-        "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity", "Enabled");
-    addSetting("HVCI Enabled", hvciFound, hvciVal, 0);
-
-    auto [kvaFound, kvaVal] = readRegistry(
-        "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\kernel", "FeatureSettingsOverride");
-    addSetting("KVA FeatureSettingsOverride", kvaFound, kvaVal, 3);
-
-    auto [kvaMaskFound, kvaMaskVal] = readRegistry(
-        "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\kernel", "FeatureSettingsOverrideMask");
-    addSetting("KVA FeatureSettingsOverrideMask", kvaMaskFound, kvaMaskVal, 3);
+    if (rpsfFound && rpsfVal == 0) {
+        Helper::printSuccess("- RequirePlatformSecurityFeatures already set to 0", false);
+    } else {
+        Helper::printConcern("- RequirePlatformSecurityFeatures=" + (rpsfFound ? std::to_string(rpsfVal) : "missing"));
+    }
 
     auto [dgLockFound, dgLockVal] = readRegistry(
         "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard", "Locked");
-    if (dgLockFound) {
-        settings.push_back("DeviceGuard Locked=" + std::to_string(dgLockVal));
+    if (dgLockFound && dgLockVal == 1) {
+        Helper::printSuccess("- DeviceGuard Locked already set to 1", false);
+    } else if (dgLockFound) {
+        Helper::printConcern("- DeviceGuard Locked=" + std::to_string(dgLockVal));
     } else {
-        settings.push_back("DeviceGuard Locked=missing");
-        pendingChanges.push_back("Set DeviceGuard Locked to 1");
+        Helper::printConcern("- Change needed: Set DeviceGuard Locked to 1");
+        Helper::pendingChanges.push_back("Set DeviceGuard Locked to 1");
+    }
+
+    auto [hvciFound, hvciVal] = readRegistry(
+        "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity", "Enabled");
+    if (hvciFound && hvciVal == 0) {
+        Helper::printSuccess("- HVCI Enabled already set to 0", false);
+    } else {
+        Helper::printConcern("- HVCI Enabled=" + (hvciFound ? std::to_string(hvciVal) : "missing"));
     }
 
     auto [hvciLockFound, hvciLockVal] = readRegistry(
         "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity", "Locked");
-    if (hvciLockFound) {
-        settings.push_back("HVCI Locked=" + std::to_string(hvciLockVal));
+    if (hvciLockFound && hvciLockVal == 1) {
+        Helper::printSuccess("- HVCI Locked already set to 1", false);
+    } else if (hvciLockFound) {
+        Helper::printConcern("- HVCI Locked=" + std::to_string(hvciLockVal));
     } else {
-        settings.push_back("HVCI Locked=missing");
-        pendingChanges.push_back("Set HVCI Locked to 1");
+        Helper::printConcern("- Change needed: Set HVCI Locked to 1");
+        Helper::pendingChanges.push_back("Set HVCI Locked to 1");
     }
 
-    std::string hypervisorOutput = Helper::runSystemCommandWithOutput(
-        "powershell -Command \"(Get-CimInstance -ClassName Win32_Processor).HypervisorPresent\"", 5000);
-    bool hypervisorPresent = hypervisorOutput.find("True") != std::string::npos;
+    auto [kvaFound, kvaVal] = readRegistry(
+        "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\kernel", "FeatureSettingsOverride");
+    if (kvaFound && kvaVal == 3) {
+        Helper::printSuccess("- KVA FeatureSettingsOverride already set to 3", false);
+    } else {
+        Helper::printConcern("- KVA FeatureSettingsOverride=" + (kvaFound ? std::to_string(kvaVal) : "missing"));
+    }
+
+    auto [kvaMaskFound, kvaMaskVal] = readRegistry(
+        "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\kernel", "FeatureSettingsOverrideMask");
+    if (kvaMaskFound && kvaMaskVal == 3) {
+        Helper::printSuccess("- KVA FeatureSettingsOverrideMask already set to 3", false);
+    } else {
+        Helper::printConcern("- KVA FeatureSettingsOverrideMask=" + (kvaMaskFound ? std::to_string(kvaMaskVal) : "missing"));
+    }
 
     std::string hvLaunchOutput = Helper::runSystemCommandWithOutput(
         "powershell -Command \"(Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\VirtualizationSecurity' -Name 'LaunchType' -ErrorAction SilentlyContinue).LaunchType\"", 5000);
-    std::string hvLaunch = "unknown";
-    if (hvLaunchOutput.find("off") != std::string::npos || hvLaunchOutput.find("Off") != std::string::npos)
-        hvLaunch = "off";
-    else if (hvLaunchOutput.find("on") != std::string::npos || hvLaunchOutput.find("On") != std::string::npos)
-        hvLaunch = "on";
-    settings.push_back("hypervisorlaunchtype=" + hvLaunch);
+    if (hvLaunchOutput.find("off") != std::string::npos || hvLaunchOutput.find("Off") != std::string::npos) {
+        Helper::printSuccess("- Hypervisor launch is already off", false);
+    } else {
+        Helper::printConcern("- Hypervisor launch=" + hvLaunchOutput);
+    }
 
     std::string hypervOutput = Helper::runSystemCommandWithOutput(
         "powershell -Command \"Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-Hypervisor | Select-Object -ExpandProperty State\"", 10000);
-    std::string hypervState = "unclear";
-    if (hypervOutput.find("Enabled") != std::string::npos) hypervState = "enabled";
-    else if (hypervOutput.find("Disabled") != std::string::npos) hypervState = "disabled";
-    settings.push_back("Microsoft-Hyper-V-Hypervisor=" + hypervState);
+    if (hypervOutput.find("Disabled") != std::string::npos) {
+        Helper::printSuccess("- Microsoft-Hyper-V-Hypervisor is disabled", false);
+    } else {
+        Helper::printConcern("- Windows feature status is unclear: Microsoft-Hyper-V-Hypervisor");
+    }
 
     std::string hypervAllOutput = Helper::runSystemCommandWithOutput(
         "powershell -Command \"Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All | Select-Object -ExpandProperty State\"", 10000);
-    std::string hypervAllState = "unclear";
-    if (hypervAllOutput.find("Enabled") != std::string::npos) hypervAllState = "enabled";
-    else if (hypervAllOutput.find("Disabled") != std::string::npos) hypervAllState = "disabled";
-    settings.push_back("Microsoft-Hyper-V-All=" + hypervAllState);
-
-    std::string settingsStr;
-    for (size_t i = 0; i < settings.size(); i++) {
-        if (i > 0) settingsStr += "; ";
-        settingsStr += settings[i];
+    if (hypervAllOutput.find("Disabled") != std::string::npos) {
+        Helper::printSuccess("- Microsoft-Hyper-V-All is disabled", false);
+    } else {
+        Helper::printConcern("- Windows feature status is unclear: Microsoft-Hyper-V-All");
     }
 
-    HKEY hKey;
-    bool anyChanged = false;
-
-    if (!dgLockFound) {
-        if (RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard",
-            0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-            DWORD val = 1;
-            if (RegSetValueEx(hKey, "Locked", 0, REG_DWORD, (BYTE*)&val, sizeof(val)) == ERROR_SUCCESS) {
-                anyChanged = true;
-                settingsStr += "; DeviceGuard Locked=missing->1";
-            }
-            RegCloseKey(hKey);
-        }
-    }
-
-    if (!hvciLockFound) {
-        if (RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity",
-            0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-            DWORD val = 1;
-            if (RegSetValueEx(hKey, "Locked", 0, REG_DWORD, (BYTE*)&val, sizeof(val)) == ERROR_SUCCESS) {
-                anyChanged = true;
-                settingsStr += "; HVCI Locked=missing->1";
-            }
-            RegCloseKey(hKey);
-        }
-    }
-
-    if (anyChanged) {
-        Helper::restartRequired = true;
-        Helper::recordResult("Security Mitigations", "WARN", "Changed: " + settingsStr);
-    }
-    else if (allGood) {
-        Helper::recordResult("Security Mitigations", "OK", settingsStr);
-    }
-    else {
-        Helper::recordResult("Security Mitigations", "WARN", settingsStr);
-    }
-
-    for (auto& s : settings) {
-        Helper::printConcern("- " + s);
-    }
-
-    if (anyChanged) {
-        for (auto& c : pendingChanges) {
-            Helper::printSuccess("- " + c, true);
-        }
-    }
+    Helper::recordResult("Security Mitigations", "OK", "Checked");
 }
 
 void Checks::checkForUpdate()
@@ -1041,6 +997,149 @@ void Checks::installVCRedist()
     Helper::printSuccess("- VCRedist is installed", false);
     Helper::recordResult("VC Redist", "OK", "Installed successfully");
     Helper::vcComplete = true;
+}
+
+void Checks::checkRiotVanguard()
+{
+    SetConsoleTitleA("Checking for Riot Vanguard");
+
+    HKEY hKey;
+    LONG result = RegOpenKeyEx(HKEY_LOCAL_MACHINE,
+        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall", 0, KEY_READ, &hKey);
+    if (result != ERROR_SUCCESS) {
+        Helper::printError("- Failed to check if Riot Vanguard is installed (Error 6, GLE=" + std::to_string(GetLastError()) + ")");
+        Helper::recordResult("Riot Vanguard", "FAIL", "RegOpen failed");
+        return;
+    }
+
+    DWORD subkeyIndex = 0;
+    char subkeyName[256];
+    DWORD subkeyNameSize = sizeof(subkeyName);
+    while (RegEnumKeyEx(hKey, subkeyIndex, subkeyName, &subkeyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+        HKEY hSubkey;
+        result = RegOpenKeyEx(hKey, subkeyName, 0, KEY_READ, &hSubkey);
+        if (result != ERROR_SUCCESS) { RegCloseKey(hKey); Helper::recordResult("Riot Vanguard", "FAIL", "RegEnum failed"); return; }
+
+        char displayName[256];
+        DWORD displayNameSize = sizeof(displayName);
+        result = RegQueryValueEx(hSubkey, "DisplayName", NULL, NULL, (LPBYTE)displayName, &displayNameSize);
+        if (result == ERROR_SUCCESS && strcmp(displayName, "Riot Vanguard") == 0) {
+            RegCloseKey(hSubkey);
+            RegCloseKey(hKey);
+            Helper::printError("- Riot Vanguard is installed");
+            Helper::recordResult("Riot Vanguard", "FAIL", "Installed");
+            return;
+        }
+        RegCloseKey(hSubkey);
+        subkeyNameSize = sizeof(subkeyName);
+        ++subkeyIndex;
+    }
+    RegCloseKey(hKey);
+    Helper::printSuccess("- Riot Vanguard is not installed", false);
+    Helper::recordResult("Riot Vanguard", "OK", "Not installed");
+}
+
+void Checks::checkVCRedist()
+{
+    SetConsoleTitleA("Checking VCRedist");
+
+    bool alreadyInstalled = (std::filesystem::exists("C:\\Windows\\System32\\vcruntime140.dll") ||
+                             std::filesystem::exists("C:\\Windows\\SysWOW64\\vcruntime140.dll")) &&
+                            (std::filesystem::exists("C:\\Windows\\System32\\msvcp140.dll") ||
+                             std::filesystem::exists("C:\\Windows\\SysWOW64\\msvcp140.dll"));
+    if (alreadyInstalled) {
+        Helper::printSuccess("- VCRedist is already installed", false);
+        Helper::recordResult("VC Redist", "OK", "Already installed");
+    }
+    else {
+        Helper::printConcern("- VCRedist is not installed");
+        Helper::recordResult("VC Redist", "FAIL", "Not installed");
+        Helper::pendingChanges.push_back("Install VCRedist");
+    }
+}
+
+void Checks::checkTimeSync()
+{
+    SetConsoleTitleA("Checking Time Sync");
+
+    std::string result = Helper::runSystemCommandWithOutput("w32tm /query /status", 5000);
+    if (result.find("error") != std::string::npos || result.find("ERROR") != std::string::npos ||
+        result.find("The computer did not respond") != std::string::npos) {
+        Helper::printConcern("- Change needed: Sync and repair Windows Time service");
+        Helper::recordResult("Time Sync", "WARN", "Sync pending approval");
+        Helper::pendingChanges.push_back("Sync and repair Windows Time service");
+    }
+    else {
+        Helper::printSuccess("- Windows Time is synced", false);
+        Helper::recordResult("Time Sync", "OK", "Synced");
+    }
+}
+
+void Checks::checkSymbols()
+{
+    SetConsoleTitleA("Checking C:\\Symbols");
+    std::string path = "C:\\Symbols";
+    if (std::filesystem::exists(path)) {
+        Helper::printConcern("- Symbols folder found at " + path);
+        Helper::recordResult("Symbols", "WARN", "Present");
+        Helper::pendingChanges.push_back("Delete C:\\Symbols");
+    }
+    else {
+        Helper::recordResult("Symbols", "OK", "Not present");
+    }
+}
+
+void Helper::applyPendingChanges()
+{
+    if (pendingChanges.empty()) return;
+
+    for (auto& change : pendingChanges) {
+        if (change.find("Sync and repair Windows Time service") != std::string::npos) {
+            Checks::syncWindowsTime();
+        }
+        else if (change.find("Install VCRedist") != std::string::npos) {
+            std::thread vcThread(Checks::installVCRedist);
+            while (Helper::vcComplete == false) {
+                Sleep(10);
+                Helper::vcCheckSleepTimes = Helper::vcCheckSleepTimes + 10;
+                if (Helper::vcCheckSleepTimes >= 30000) {
+                    Helper::printConcern("- VCRedist is taking too long, continuing without waiting");
+                    break;
+                }
+            }
+            vcThread.detach();
+        }
+        else if (change.find("Uninstall Riot Vanguard") != std::string::npos) {
+            Checks::uninstallRiotVanguard();
+        }
+        else if (change.find("Delete C:\\Symbols") != std::string::npos) {
+            Checks::deleteSymbols();
+        }
+        else if (change.find("Set DeviceGuard Locked to 1") != std::string::npos) {
+            HKEY hKey;
+            if (RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard",
+                0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+                DWORD val = 1;
+                RegSetValueEx(hKey, "Locked", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+                RegCloseKey(hKey);
+                Helper::printSuccess("- Set DeviceGuard Locked from missing to 1", true);
+                Helper::restartRequired = true;
+            }
+        }
+        else if (change.find("Set HVCI Locked to 1") != std::string::npos) {
+            HKEY hKey;
+            if (RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity",
+                0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+                DWORD val = 1;
+                RegSetValueEx(hKey, "Locked", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
+                RegCloseKey(hKey);
+                Helper::printSuccess("- Set HVCI Locked from missing to 1", true);
+                Helper::restartRequired = true;
+            }
+        }
+    }
+
+    pendingChanges.clear();
 }
 void Checks::checkSecureBoot()
 {
