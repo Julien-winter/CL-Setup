@@ -717,6 +717,15 @@ void Checks::checkWindowsDefender()
         return;
     }
 
+    if (Helper::g_phase == 1) {
+        CloseServiceHandle(service);
+        CloseServiceHandle(scm);
+        Helper::printConcern("- Change needed: Disable Windows Defender");
+        Helper::recordResult("Windows Defender", "WARN", "Needs disable");
+        Helper::pendingChanges.push_back("Disable Windows Defender");
+        return;
+    }
+
     // Try to stop + disable
     CloseServiceHandle(service);
     service = OpenService(scm, "WinDefend", SERVICE_CHANGE_CONFIG | SERVICE_STOP | SERVICE_QUERY_STATUS);
@@ -1163,6 +1172,27 @@ void Helper::applyPendingChanges()
                 Helper::restartRequired = true;
             }
         }
+        else if (change.find("Disable Fast-Boot") != std::string::npos) {
+            Checks::checkFastBoot();
+        }
+        else if (change.find("Disable Exploit-Protection") != std::string::npos) {
+            Checks::checkExploitProtection();
+        }
+        else if (change.find("Disable SmartScreen") != std::string::npos) {
+            Checks::checkSmartScreen();
+        }
+        else if (change.find("Enable Gamebar") != std::string::npos) {
+            Checks::checkGameBar();
+        }
+        else if (change.find("Disable Chrome protection") != std::string::npos) {
+            Checks::disableChromeProtection();
+        }
+        else if (change.find("Disable HVCI") != std::string::npos || change.find("Disable VBS") != std::string::npos) {
+            Checks::checkCoreIsolation();
+        }
+        else if (change.find("Disable Windows Defender") != std::string::npos) {
+            Checks::checkWindowsDefender();
+        }
     }
 
     pendingChanges.clear();
@@ -1295,6 +1325,12 @@ void Checks::disableChromeProtection()
             return;
         }
     }
+    if (Helper::g_phase == 1) {
+        Helper::printConcern("- Change needed: Disable Chrome protection");
+        Helper::recordResult("Chrome Protection", "WARN", "Needs disable");
+        Helper::pendingChanges.push_back("Disable Chrome protection");
+        return;
+    }
 
     HKEY hKey; DWORD disp; DWORD value = 0x00000001;
     LONG createKey = RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SOFTWARE\\Policies\\Google\\Chrome",
@@ -1303,7 +1339,7 @@ void Checks::disableChromeProtection()
     RegCloseKey(hKey);
 
     if (createKey == ERROR_SUCCESS && createDWORD == ERROR_SUCCESS) {
-        Helper::printSuccess("- Successfully disabled protection on Google Chrome", true);
+        Helper::printSuccess("- Disabled protection on Google Chrome", true);
         Helper::recordResult("Chrome Protection", "OK", "Disabled (changed)");
     }
     else {
@@ -1393,13 +1429,19 @@ void Checks::checkFastBoot()
             return;
         }
     }
+    if (Helper::g_phase == 1) {
+        Helper::printConcern("- Change needed: Disable Fast-Boot");
+        Helper::recordResult("Fast Boot", "WARN", "Needs disable");
+        Helper::pendingChanges.push_back("Disable Fast-Boot");
+        return;
+    }
     HKEY hKey; DWORD disp; DWORD value = 0;
     LONG ck = RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power",
         0, NULL, REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hKey, &disp);
     LONG cd = RegSetValueEx(hKey, "HiberbootEnabled", NULL, REG_DWORD, (const BYTE*)&value, sizeof(value));
     RegCloseKey(hKey);
     if (ck == ERROR_SUCCESS && cd == ERROR_SUCCESS) {
-        Helper::printSuccess("- Successfully disabled Fast-Boot", true);
+        Helper::printSuccess("- Disabled Fast-Boot", true);
         Helper::restartRequired = true;
         Helper::recordResult("Fast Boot", "OK", "Disabled (changed)");
     }
@@ -1421,6 +1463,12 @@ void Checks::checkExploitProtection()
             return;
         }
     }
+    if (Helper::g_phase == 1) {
+        Helper::printConcern("- Change needed: Disable Exploit-Protection");
+        Helper::recordResult("Exploit Protection", "WARN", "Needs disable");
+        Helper::pendingChanges.push_back("Disable Exploit-Protection");
+        return;
+    }
     HKEY hKey; DWORD disp; DWORD value = 1;
     LONG ck = RegCreateKeyEx(HKEY_LOCAL_MACHINE,
         "SOFTWARE\\Policies\\Microsoft\\Windows Defender Security Center\\App and Browser protection",
@@ -1428,7 +1476,7 @@ void Checks::checkExploitProtection()
     LONG cd = RegSetValueEx(hKey, "DisallowExploitProtectionOverride", NULL, REG_DWORD, (const BYTE*)&value, sizeof(value));
     RegCloseKey(hKey);
     if (ck == ERROR_SUCCESS && cd == ERROR_SUCCESS) {
-        Helper::printSuccess("- Successfully disabled Exploit-Protection", true);
+        Helper::printSuccess("- Disabled Exploit-Protection", true);
         Helper::restartRequired = true;
         Helper::recordResult("Exploit Protection", "OK", "Disabled (changed)");
     }
@@ -1449,13 +1497,19 @@ void Checks::checkSmartScreen()
             return;
         }
     }
+    if (Helper::g_phase == 1) {
+        Helper::printConcern("- Change needed: Disable SmartScreen");
+        Helper::recordResult("SmartScreen", "WARN", "Needs disable");
+        Helper::pendingChanges.push_back("Disable SmartScreen");
+        return;
+    }
     HKEY hKey; DWORD disp; DWORD value = 0;
     LONG ck = RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SOFTWARE\\Policies\\Microsoft\\Windows\\System",
         0, NULL, REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hKey, &disp);
     LONG cd = RegSetValueEx(hKey, "EnableSmartScreen", NULL, REG_DWORD, (const BYTE*)&value, sizeof(value));
     RegCloseKey(hKey);
     if (ck == ERROR_SUCCESS && cd == ERROR_SUCCESS) {
-        Helper::printSuccess("- Successfully disabled SmartScreen", true);
+        Helper::printSuccess("- Disabled SmartScreen", true);
         Helper::restartRequired = true;
         Helper::recordResult("SmartScreen", "OK", "Disabled (changed)");
     }
@@ -1476,13 +1530,19 @@ void Checks::checkGameBar()
             return;
         }
     }
+    if (Helper::g_phase == 1) {
+        Helper::printConcern("- Change needed: Enable Gamebar");
+        Helper::recordResult("Game Bar", "WARN", "Needs enable");
+        Helper::pendingChanges.push_back("Enable Gamebar");
+        return;
+    }
     HKEY hKey; DWORD disp; DWORD value = 1;
     LONG ck = RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\GameDVR",
         0, NULL, REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hKey, &disp);
     LONG cd = RegSetValueEx(hKey, "AppCaptureEnabled", NULL, REG_DWORD, (const BYTE*)&value, sizeof(value));
     RegCloseKey(hKey);
     if (ck == ERROR_SUCCESS && cd == ERROR_SUCCESS) {
-        Helper::printSuccess("- Successfully enabled Gamebar", true);
+        Helper::printSuccess("- Enabled Gamebar", true);
         Helper::restartRequired = true;
         Helper::recordResult("Game Bar", "OK", "Enabled (changed)");
     }
@@ -1589,6 +1649,17 @@ void Checks::checkCoreIsolation()
     if (hvciRead && hvci == 0 && vbsRead && vbs == 0) {
         Helper::printSuccess("- Core-Isolation (HVCI) is disabled", false);
         Helper::recordResult("Core Isolation", "OK", "Disabled");
+        return;
+    }
+
+    if (Helper::g_phase == 1) {
+        std::string needs;
+        if (hvci == 1) needs += "HVCI";
+        if (vbs == 1) needs += (needs.empty() ? "" : ", ") + std::string("VBS");
+        Helper::printConcern("- Change needed: Disable " + needs);
+        Helper::recordResult("Core Isolation", "WARN", "Needs disable: " + needs);
+        if (hvci == 1) Helper::pendingChanges.push_back("Disable HVCI");
+        if (vbs == 1) Helper::pendingChanges.push_back("Disable VBS");
         return;
     }
 
