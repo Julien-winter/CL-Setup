@@ -184,7 +184,6 @@ int main(int argc, char* argv[])
     if (!Helper::isCheckSkipped(5)) Checks::checkRiotVanguard();
     if (!Helper::isCheckSkipped(6)) Checks::checkVCRedist();
     if (!Helper::isCheckSkipped(8)) Checks::disableChromeProtection();
-    if (!Helper::isCheckSkipped(9)) Checks::checkTimeSync();
     if (!Helper::isCheckSkipped(12)) Checks::checkFastBoot();
     if (!Helper::isCheckSkipped(13)) Checks::checkExploitProtection();
     if (!Helper::isCheckSkipped(14)) Checks::checkSmartScreen();

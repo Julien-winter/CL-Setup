@@ -557,7 +557,29 @@ void Checks::checkSecurityMitigations()
         Helper::printConcern("- Windows feature status is unclear: Microsoft-Hyper-V-All");
     }
 
-    Helper::recordResult("Security Mitigations", "OK", "Checked");
+    std::string settingsStr;
+    settingsStr += "EnableVirtualizationBasedSecurity=" + (vbsFound ? std::to_string(vbsVal) : std::string("missing"));
+    settingsStr += "; RequirePlatformSecurityFeatures=" + (rpsfFound ? std::to_string(rpsfVal) : std::string("missing"));
+    settingsStr += "; DeviceGuard Locked=" + (dgLockFound ? std::to_string(dgLockVal) : std::string("missing"));
+    settingsStr += "; HVCI Enabled=" + (hvciFound ? std::to_string(hvciVal) : std::string("missing"));
+    settingsStr += "; HVCI Locked=" + (hvciLockFound ? std::to_string(hvciLockVal) : std::string("missing"));
+    settingsStr += "; KVA FeatureSettingsOverride=" + (kvaFound ? std::to_string(kvaVal) : std::string("missing"));
+    settingsStr += "; KVA FeatureSettingsOverrideMask=" + (kvaMaskFound ? std::to_string(kvaMaskVal) : std::string("missing"));
+
+    std::string hvLaunchStr = hvLaunchOutput;
+    while (!hvLaunchStr.empty() && (hvLaunchStr.back() == '\r' || hvLaunchStr.back() == '\n' || hvLaunchStr.back() == ' '))
+        hvLaunchStr.pop_back();
+    settingsStr += "; hypervisorlaunchtype=" + (hvLaunchStr.empty() ? "off" : hvLaunchStr);
+
+    std::string hypervState = (hypervOutput.find("Enabled") != std::string::npos) ? "enabled" :
+                              (hypervOutput.find("Disabled") != std::string::npos) ? "disabled" : "unclear";
+    settingsStr += "; Microsoft-Hyper-V-Hypervisor=" + hypervState;
+
+    std::string hypervAllState = (hypervAllOutput.find("Enabled") != std::string::npos) ? "enabled" :
+                                 (hypervAllOutput.find("Disabled") != std::string::npos) ? "disabled" : "unclear";
+    settingsStr += "; Microsoft-Hyper-V-All=" + hypervAllState;
+
+    Helper::recordResult("Security Mitigations", "OK", settingsStr);
 }
 
 void Checks::checkForUpdate()
