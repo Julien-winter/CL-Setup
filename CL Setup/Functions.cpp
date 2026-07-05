@@ -14,7 +14,7 @@ namespace Helper {
     std::mutex g_resultsMutex;
     std::string g_repoUrl = "Julien-winter/CL-Setup";
     std::string g_appName = "CL-Setup";
-    std::string g_appVersion = "1.1.1";
+    std::string g_appVersion = "1.1.2";
 }
 
 void Helper::recordResult(const std::string& check, const std::string& status, const std::string& message)
@@ -151,14 +151,14 @@ void Helper::showHelp()
     std::cout << "  --headless          Run without user interaction\n";
     std::cout << "  --quiet             Only show errors and warnings\n";
     std::cout << "  --export FILE       Export results as JSON to FILE\n";
-    std::cout << "  --skip N[,M,...]    Skip specific checks by number (1-22)\n";
-    std::cout << "  --only N[,M,...]    Run only specific checks by number (1-22)\n\n";
+    std::cout << "  --skip N[,M,...]    Skip specific checks by number (1-24)\n";
+    std::cout << "  --only N[,M,...]    Run only specific checks by number (1-24)\n\n";
     std::cout << "Check Numbers:\n";
     std::cout << "  1=WindowsDefender 2=3rdPartyAV 3=SecureBoot 4=CPU-V 5=RiotVanguard\n";
     std::cout << "  6=VCRedist 7=Chrome 8=ChromeProtection 9=TimeSync 10=Winver\n";
     std::cout << "  11=Symbols 12=FastBoot 13=ExploitProtection 14=SmartScreen\n";
     std::cout << "  15=GameBar 16=TPM 17=CoreIsolation 18=DMAProtection 19=ModifiedOS\n";
-    std::cout << "  20=Internet 21=VM-Detect 22=Auto-Update\n";
+    std::cout << "  20=Internet 21=VM-Detect 22=Auto-Update 23=NetworkAdapters 24=SecurityMitigations\n";
 }
 
 CLIConfig Helper::parseCLI(int argc, char* argv[])
@@ -332,6 +332,98 @@ void Checks::checkInternet()
     Helper::recordResult("Internet", "FAIL", "No connectivity - fix attempts failed");
 }
 
+void Checks::checkNetworkAdapters()
+{
+    SetConsoleTitleA("Checking Network Adapters");
+
+    std::string output = Helper::runSystemCommandWithOutput(
+        "netsh interface show interface", 10000);
+
+    if (output.empty() || output.find("ERROR") != std::string::npos) {
+        Helper::printConcern("- Could not retrieve network adapter info");
+        Helper::recordResult("Network Adapters", "WARN", "Query failed");
+        return;
+    }
+
+    std::istringstream stream(output);
+    std::string line;
+    std::vector<std::string> adapters;
+    int usedCount = 0;
+    int totalCount = 0;
+
+    while (std::getline(stream, line)) {
+        if (line.empty() || line.find("Admin State") != std::string::npos ||
+            line.find("------") != std::string::npos) continue;
+
+        std::string trimmed = line;
+        while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\t'))
+            trimmed.erase(trimmed.begin());
+
+        if (trimmed.empty()) continue;
+
+        bool isEnabled = (trimmed.find("Enabled") != std::string::npos);
+        bool isDisabled = (trimmed.find("Disabled") != std::string::npos);
+        if (!isEnabled && !isDisabled) continue;
+
+        std::string adapterName;
+        size_t pos = trimmed.find("Enabled");
+        if (pos == std::string::npos) pos = trimmed.find("Disabled");
+        if (pos != std::string::npos) {
+            adapterName = trimmed.substr(pos);
+            auto tabPos = adapterName.find('\t');
+            if (tabPos != std::string::npos) {
+                adapterName = adapterName.substr(tabPos + 1);
+                auto tabPos2 = adapterName.find('\t');
+                if (tabPos2 != std::string::npos)
+                    adapterName = adapterName.substr(0, tabPos2);
+                else {
+                    auto rnPos = adapterName.find("\r\n");
+                    if (rnPos != std::string::npos) adapterName = adapterName.substr(0, rnPos);
+                }
+            }
+            while (!adapterName.empty() && (adapterName.back() == ' ' || adapterName.back() == '\t' || adapterName.back() == '\r' || adapterName.back() == '\n'))
+                adapterName.pop_back();
+        }
+
+        if (adapterName.empty()) continue;
+
+        std::string status;
+        if (adapterName.find("Loopback") != std::string::npos) {
+            status = "NOT USED (Up) [loopback]";
+        }
+        else if (isDisabled) {
+            status = "NOT USED (Down)";
+        }
+        else {
+            status = "USED (Up)";
+            usedCount++;
+        }
+        totalCount++;
+        adapters.push_back(adapterName + " - " + status);
+    }
+
+    std::string adapterList;
+    for (size_t i = 0; i < adapters.size(); i++) {
+        if (i > 0) adapterList += "; ";
+        adapterList += adapters[i];
+    }
+
+    std::string message = std::to_string(usedCount) + "/" + std::to_string(totalCount) + " used: " + adapterList;
+    Helper::recordResult("Network Adapters", "OK", message);
+
+    for (auto& a : adapters) {
+        if (a.find("USED") != std::string::npos && a.find("NOT USED") == std::string::npos) {
+            Color::setForegroundColor(Color::Green);
+            std::cout << "[+] ";
+            Color::setForegroundColor(Color::White);
+            std::cout << "- Adapter: " << a << std::endl;
+        }
+        else {
+            Helper::printConcern("- Adapter: " + a);
+        }
+    }
+}
+
 void Checks::checkVM()
 {
     SetConsoleTitleA("Checking for Virtual Machine");
@@ -364,6 +456,151 @@ void Checks::checkVM()
     }
     else {
         Helper::recordResult("VM Detection", "OK", "Bare metal");
+    }
+}
+
+void Checks::checkSecurityMitigations()
+{
+    SetConsoleTitleA("Checking Security Mitigations");
+
+    std::vector<std::string> settings;
+    std::vector<std::string> pendingChanges;
+    bool allGood = true;
+
+    auto readRegistry = [](const char* subkey, const char* valueName) -> std::pair<bool, DWORD> {
+        DWORD val = 0;
+        bool found = Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE, subkey, valueName, &val);
+        return {found, val};
+    };
+
+    auto addSetting = [&](const std::string& name, bool found, DWORD value, DWORD expected) {
+        if (!found) {
+            settings.push_back(name + "=missing");
+            return;
+        }
+        settings.push_back(name + "=" + std::to_string(value));
+        if (value != expected) {
+            allGood = false;
+        }
+    };
+
+    auto [vbsFound, vbsVal] = readRegistry(
+        "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard", "EnableVirtualizationBasedSecurity");
+    addSetting("EnableVirtualizationBasedSecurity", vbsFound, vbsVal, 0);
+
+    auto [rpsfFound, rpsfVal] = readRegistry(
+        "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard", "RequirePlatformSecurityFeatures");
+    addSetting("RequirePlatformSecurityFeatures", rpsfFound, rpsfVal, 0);
+
+    auto [hvciFound, hvciVal] = readRegistry(
+        "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity", "Enabled");
+    addSetting("HVCI Enabled", hvciFound, hvciVal, 0);
+
+    auto [kvaFound, kvaVal] = readRegistry(
+        "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\kernel", "FeatureSettingsOverride");
+    addSetting("KVA FeatureSettingsOverride", kvaFound, kvaVal, 3);
+
+    auto [kvaMaskFound, kvaMaskVal] = readRegistry(
+        "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\kernel", "FeatureSettingsOverrideMask");
+    addSetting("KVA FeatureSettingsOverrideMask", kvaMaskFound, kvaMaskVal, 3);
+
+    auto [dgLockFound, dgLockVal] = readRegistry(
+        "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard", "Locked");
+    if (dgLockFound) {
+        settings.push_back("DeviceGuard Locked=" + std::to_string(dgLockVal));
+    } else {
+        settings.push_back("DeviceGuard Locked=missing");
+        pendingChanges.push_back("Set DeviceGuard Locked to 1");
+    }
+
+    auto [hvciLockFound, hvciLockVal] = readRegistry(
+        "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity", "Locked");
+    if (hvciLockFound) {
+        settings.push_back("HVCI Locked=" + std::to_string(hvciLockVal));
+    } else {
+        settings.push_back("HVCI Locked=missing");
+        pendingChanges.push_back("Set HVCI Locked to 1");
+    }
+
+    std::string hypervisorOutput = Helper::runSystemCommandWithOutput(
+        "powershell -Command \"(Get-CimInstance -ClassName Win32_Processor).HypervisorPresent\"", 5000);
+    bool hypervisorPresent = hypervisorOutput.find("True") != std::string::npos;
+
+    std::string hvLaunchOutput = Helper::runSystemCommandWithOutput(
+        "powershell -Command \"(Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\VirtualizationSecurity' -Name 'LaunchType' -ErrorAction SilentlyContinue).LaunchType\"", 5000);
+    std::string hvLaunch = "unknown";
+    if (hvLaunchOutput.find("off") != std::string::npos || hvLaunchOutput.find("Off") != std::string::npos)
+        hvLaunch = "off";
+    else if (hvLaunchOutput.find("on") != std::string::npos || hvLaunchOutput.find("On") != std::string::npos)
+        hvLaunch = "on";
+    settings.push_back("hypervisorlaunchtype=" + hvLaunch);
+
+    std::string hypervOutput = Helper::runSystemCommandWithOutput(
+        "powershell -Command \"Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-Hypervisor | Select-Object -ExpandProperty State\"", 10000);
+    std::string hypervState = "unclear";
+    if (hypervOutput.find("Enabled") != std::string::npos) hypervState = "enabled";
+    else if (hypervOutput.find("Disabled") != std::string::npos) hypervState = "disabled";
+    settings.push_back("Microsoft-Hyper-V-Hypervisor=" + hypervState);
+
+    std::string hypervAllOutput = Helper::runSystemCommandWithOutput(
+        "powershell -Command \"Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All | Select-Object -ExpandProperty State\"", 10000);
+    std::string hypervAllState = "unclear";
+    if (hypervAllOutput.find("Enabled") != std::string::npos) hypervAllState = "enabled";
+    else if (hypervAllOutput.find("Disabled") != std::string::npos) hypervAllState = "disabled";
+    settings.push_back("Microsoft-Hyper-V-All=" + hypervAllState);
+
+    std::string settingsStr;
+    for (size_t i = 0; i < settings.size(); i++) {
+        if (i > 0) settingsStr += "; ";
+        settingsStr += settings[i];
+    }
+
+    HKEY hKey;
+    bool anyChanged = false;
+
+    if (!dgLockFound) {
+        if (RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard",
+            0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+            DWORD val = 1;
+            if (RegSetValueEx(hKey, "Locked", 0, REG_DWORD, (BYTE*)&val, sizeof(val)) == ERROR_SUCCESS) {
+                anyChanged = true;
+                settingsStr += "; DeviceGuard Locked=missing->1";
+            }
+            RegCloseKey(hKey);
+        }
+    }
+
+    if (!hvciLockFound) {
+        if (RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity",
+            0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+            DWORD val = 1;
+            if (RegSetValueEx(hKey, "Locked", 0, REG_DWORD, (BYTE*)&val, sizeof(val)) == ERROR_SUCCESS) {
+                anyChanged = true;
+                settingsStr += "; HVCI Locked=missing->1";
+            }
+            RegCloseKey(hKey);
+        }
+    }
+
+    if (anyChanged) {
+        Helper::restartRequired = true;
+        Helper::recordResult("Security Mitigations", "WARN", "Changed: " + settingsStr);
+    }
+    else if (allGood) {
+        Helper::recordResult("Security Mitigations", "OK", settingsStr);
+    }
+    else {
+        Helper::recordResult("Security Mitigations", "WARN", settingsStr);
+    }
+
+    for (auto& s : settings) {
+        Helper::printConcern("- " + s);
+    }
+
+    if (anyChanged) {
+        for (auto& c : pendingChanges) {
+            Helper::printSuccess("- " + c, true);
+        }
     }
 }
 

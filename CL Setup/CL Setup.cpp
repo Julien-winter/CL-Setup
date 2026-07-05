@@ -137,11 +137,17 @@ int main(int argc, char* argv[])
     if (!Helper::isCheckSkipped(20)) Checks::checkInternet();
     else { Helper::printConcern("- Skipped: Internet"); Helper::recordResult("Internet", "SKIPPED", ""); }
 
+    if (!Helper::isCheckSkipped(23)) Checks::checkNetworkAdapters();
+    else { Helper::printConcern("- Skipped: Network Adapters"); Helper::recordResult("Network Adapters", "SKIPPED", ""); }
+
     if (!Helper::isCheckSkipped(21)) Checks::checkVM();
     else { Helper::printConcern("- Skipped: VM Detection"); Helper::recordResult("VM Detection", "SKIPPED", ""); }
 
     if (!Helper::isCheckSkipped(22)) Checks::checkForUpdate();
     else { Helper::printConcern("- Skipped: Auto-Update"); Helper::recordResult("Auto-Update", "SKIPPED", ""); }
+
+    if (!Helper::isCheckSkipped(24)) Checks::checkSecurityMitigations();
+    else { Helper::printConcern("- Skipped: Security Mitigations"); Helper::recordResult("Security Mitigations", "SKIPPED", ""); }
 
     Color::setForegroundColor(Color::LightGray);
     std::cout << "-----------------------------------------------------------------\n";
