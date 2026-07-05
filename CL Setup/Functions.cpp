@@ -161,6 +161,7 @@ void Helper::showHelp()
     std::cout << "  11=Symbols 12=FastBoot 13=ExploitProtection 14=SmartScreen\n";
     std::cout << "  15=GameBar 16=TPM 17=CoreIsolation 18=DMAProtection 19=ModifiedOS\n";
     std::cout << "  20=Internet 21=VM-Detect 22=Auto-Update 23=NetworkAdapters 24=SecurityMitigations\n";
+    std::cout << "  25=UAC 26=WindowsUpdate 27=AntiCheat\n";
 }
 
 CLIConfig Helper::parseCLI(int argc, char* argv[])
@@ -624,6 +625,183 @@ void Checks::checkForUpdate()
     }
 }
 
+void Checks::checkUAC()
+{
+    SetConsoleTitleA("Checking UAC Settings");
+    DWORD lua;
+    if (Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE,
+        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", "EnableLUA", &lua)) {
+        if (lua == 0) {
+            Helper::printSuccess("- UAC (LUA) is disabled", false);
+            Helper::recordResult("UAC", "OK", "LUA disabled");
+        } else {
+            Helper::printConcern("- UAC (LUA) is enabled (EnableLUA=" + std::to_string(lua) + ")");
+            Helper::recordResult("UAC", "WARN", "LUA enabled: " + std::to_string(lua));
+        }
+    } else {
+        Helper::printConcern("- Could not read UAC EnableLUA (Error 35)");
+        Helper::recordResult("UAC", "WARN", "Cannot read EnableLUA");
+    }
+}
+
+void Checks::checkWindowsUpdate()
+{
+    SetConsoleTitleA("Checking Windows Update Status");
+    bool updateDisabled = false;
+    DWORD noAuto;
+    if (Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE,
+        "SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU", "NoAutoUpdate", &noAuto)) {
+        if (noAuto == 1) {
+            Helper::printConcern("- Windows Update is DISABLED via policy");
+            Helper::recordResult("Windows Update", "WARN", "Disabled via policy (NoAutoUpdate=1)");
+            updateDisabled = true;
+        }
+    }
+
+    SC_HANDLE scm = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
+    if (scm) {
+        SC_HANDLE svc = OpenService(scm, "wuauserv", SERVICE_QUERY_STATUS);
+        if (svc) {
+            SERVICE_STATUS_PROCESS ssp;
+            DWORD needed;
+            if (QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, (LPBYTE)&ssp, sizeof(ssp), &needed)) {
+                if (ssp.dwCurrentState == SERVICE_STOPPED) {
+                    if (!updateDisabled) Helper::printConcern("- Windows Update service is stopped");
+                    Helper::recordResult("Windows Update", "WARN", "Service stopped");
+                    updateDisabled = true;
+                }
+            }
+            CloseServiceHandle(svc);
+        }
+        CloseServiceHandle(scm);
+    }
+
+    if (!updateDisabled) {
+        Helper::printSuccess("- Windows Update is active", false);
+        Helper::recordResult("Windows Update", "OK", "Active");
+    }
+}
+
+void Checks::checkAntiCheat()
+{
+    SetConsoleTitleA("Checking for Anti-Cheat Software");
+
+    struct AntiCheatEntry {
+        std::string name;
+        std::string serviceName;
+        std::string regKey;
+        std::string regValue;
+    };
+
+    std::vector<AntiCheatEntry> entries = {
+        {"EasyAntiCheat", "EasyAntiCheat", "SYSTEM\\CurrentControlSet\\Services\\EasyAntiCheat", ""},
+        {"BattlEye", "BEDaisy", "SYSTEM\\CurrentControlSet\\Services\\BEDaisy", ""},
+        {"FaceIt Anti-Cheat", "FAC", "SYSTEM\\CurrentControlSet\\Services\\FAC", ""},
+        {"PunkBuster", "PnkBstrA", "SYSTEM\\CurrentControlSet\\Services\\PnkBstrA", ""},
+        {"nProtect GameGuard", "npgmsvc", "SYSTEM\\CurrentControlSet\\Services\\npgmsvc", ""},
+        {"Xigncode3", "XIGNCODE3", "SYSTEM\\CurrentControlSet\\Services\\XIGNCODE3", ""},
+        {"Denuvo Anti-Cheat", "denuvo", "SYSTEM\\CurrentControlSet\\Services\\denuvo", ""},
+        {"StarForce", "StarForce", "SYSTEM\\CurrentControlSet\\Services\\StarForce", ""},
+    };
+
+    std::vector<std::string> found;
+    for (auto& ac : entries) {
+        DWORD dummy;
+        if (Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE, ac.regKey.c_str(), "Start", &dummy)) {
+            found.push_back(ac.name);
+        } else {
+            SC_HANDLE scm = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
+            if (scm) {
+                SC_HANDLE svc = OpenService(scm, ac.serviceName.c_str(), SERVICE_QUERY_STATUS);
+                if (svc) {
+                    found.push_back(ac.name);
+                    CloseServiceHandle(svc);
+                }
+                CloseServiceHandle(scm);
+            }
+        }
+    }
+
+    if (found.empty()) {
+        Helper::printSuccess("- No anti-cheat software detected", false);
+        Helper::recordResult("Anti-Cheat", "OK", "None detected");
+    } else {
+        std::string list;
+        for (size_t i = 0; i < found.size(); i++) {
+            if (i > 0) list += ", ";
+            list += found[i];
+        }
+        Helper::printError("- Anti-cheat software detected: " + list);
+        Helper::recordResult("Anti-Cheat", "FAIL", "Found: " + list);
+    }
+}
+
+void Checks::createRestorePoint()
+{
+    SetConsoleTitleA("Creating System Restore Point");
+    HMODULE srLib = LoadLibraryW(L"srclient.dll");
+    if (!srLib) {
+        Helper::printConcern("- Could not load srclient.dll, skipping restore point");
+        Helper::recordResult("Restore Point", "SKIPPED", "srclient.dll not found");
+        return;
+    }
+    typedef BOOL(WINAPI *SRSetRestorePointW_t)(PRESTOREPOINTINFOW, PSTATEMGRSTATUS);
+    SRSetRestorePointW_t pSR = (SRSetRestorePointW_t)GetProcAddress(srLib, "SRSetRestorePointW");
+    if (!pSR) {
+        FreeLibrary(srLib);
+        Helper::printConcern("- SRSetRestorePointW not available, skipping restore point");
+        Helper::recordResult("Restore Point", "SKIPPED", "API not available");
+        return;
+    }
+    RESTOREPOINTINFOW rpi;
+    rpi.dwEventType = BEGIN_SYSTEM_CHANGE;
+    rpi.dwRestorePtType = MODIFY_SETTINGS;
+    rpi.llSequenceNumber = 0;
+    std::wstring desc = L"CL-Setup v" + std::wstring(Helper::g_appVersion.begin(), Helper::g_appVersion.end());
+    wcsncpy_s(rpi.szDescription, desc.c_str(), _TRUNCATE);
+    STATEMGRSTATUS sms;
+    if (pSR(&rpi, &sms)) {
+        Helper::printSuccess("- System Restore Point created", true);
+        Helper::recordResult("Restore Point", "OK", "Created");
+    } else {
+        Helper::printConcern("- Failed to create System Restore Point (error " + std::to_string(sms.nStatus) + ")");
+        Helper::recordResult("Restore Point", "WARN", "Failed: " + std::to_string(sms.nStatus));
+    }
+    FreeLibrary(srLib);
+}
+
+static std::string g_backupDir;
+
+void Checks::backupRegistryKey(const std::string& key, const std::string& label)
+{
+    if (g_backupDir.empty()) {
+        wchar_t temp[MAX_PATH];
+        GetTempPathW(MAX_PATH, temp);
+        std::wstring dir = std::wstring(temp) + L"CL-Setup\\backups\\";
+        CreateDirectoryW(dir.c_str(), NULL);
+        int len = WideCharToMultiByte(CP_UTF8, 0, dir.c_str(), -1, NULL, 0, NULL, NULL);
+        g_backupDir.resize(len - 1);
+        WideCharToMultiByte(CP_UTF8, 0, dir.c_str(), -1, &g_backupDir[0], len, NULL, NULL);
+    }
+
+    std::string filename = g_backupDir + label + ".reg";
+    std::string safeKey = key;
+    size_t p = 0;
+    while ((p = safeKey.find('\\', p)) != std::string::npos) {
+        safeKey.insert(p, "\\");
+        p += 2;
+    }
+
+    std::string cmd = "reg export \"" + key + "\" \"" + filename + "\" /y 2>nul";
+    Helper::runSystemCommand(cmd.c_str());
+
+    if (std::filesystem::exists(filename)) {
+        Helper::printSuccess("- Backed up " + label + " to " + filename, true);
+    } else {
+        Helper::printConcern("- Could not back up " + label + " (key may not exist)");
+    }
+}
+
 bool Checks::checkDefenderTamperProtection()
 {
     DWORD tamperProtection = 0;
@@ -988,12 +1166,26 @@ void Checks::installVCRedist()
         return;
     }
 
-    HRESULT downloadX64 = URLDownloadToFileA(NULL, "https://aka.ms/vs/17/release/vc_redist.x64.exe",
-        "C:\\Windows\\VC_redist.x64.exe", 0, NULL);
-    HRESULT downloadX86 = URLDownloadToFileA(NULL, "https://aka.ms/vs/17/release/vc_redist.x86.exe",
-        "C:\\Windows\\VC_redist.x86.exe", 0, NULL);
+    wchar_t tempW[MAX_PATH];
+    GetTempPathW(MAX_PATH, tempW);
+    std::wstring tempDir = std::wstring(tempW) + L"CL-Setup\\";
+    CreateDirectoryW(tempDir.c_str(), NULL);
+    std::wstring vcX64Path = tempDir + L"VC_redist.x64.exe";
+    std::wstring vcX86Path = tempDir + L"VC_redist.x86.exe";
 
-    if (downloadX64 != S_OK || !std::filesystem::exists("C:\\Windows\\VC_redist.x64.exe")) {
+    auto ws2s = [](const std::wstring& ws) -> std::string {
+        int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, NULL, 0, NULL, NULL);
+        std::string s(len - 1, 0);
+        WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, &s[0], len, NULL, NULL);
+        return s;
+    };
+
+    HRESULT downloadX64 = URLDownloadToFileA(NULL, "https://aka.ms/vs/17/release/vc_redist.x64.exe",
+        ws2s(vcX64Path).c_str(), 0, NULL);
+    HRESULT downloadX86 = URLDownloadToFileA(NULL, "https://aka.ms/vs/17/release/vc_redist.x86.exe",
+        ws2s(vcX86Path).c_str(), 0, NULL);
+
+    if (downloadX64 != S_OK || !std::filesystem::exists(vcX64Path)) {
         Helper::printError("- Failed to download VCRedist x64 (Error 9, HR=" + std::to_string(downloadX64) + ")");
         Helper::recordResult("VC Redist", "FAIL", "Download x64 failed");
         Sleep(1000);
@@ -1002,7 +1194,7 @@ void Checks::installVCRedist()
         Helper::vcComplete = true;
         return;
     }
-    if (downloadX86 != S_OK || !std::filesystem::exists("C:\\Windows\\VC_redist.x86.exe")) {
+    if (downloadX86 != S_OK || !std::filesystem::exists(vcX86Path)) {
         Helper::printError("- Failed to download VCRedist x86 (Error 10, HR=" + std::to_string(downloadX86) + ")");
         Helper::recordResult("VC Redist", "FAIL", "Download x86 failed");
         Sleep(1000);
@@ -1013,8 +1205,10 @@ void Checks::installVCRedist()
     }
 
     SetConsoleTitleA("Installing VCRedist");
-    Helper::runSystemCommand("C:\\Windows\\VC_redist.x64.exe /install /q /norestart");
-    Helper::runSystemCommand("C:\\Windows\\VC_redist.x86.exe /install /q /norestart");
+    std::string cmdX64 = ws2s(vcX64Path) + " /install /q /norestart";
+    std::string cmdX86 = ws2s(vcX86Path) + " /install /q /norestart";
+    Helper::runSystemCommand(cmdX64.c_str());
+    Helper::runSystemCommand(cmdX86.c_str());
 
     if (!(std::filesystem::exists("C:\\Windows\\System32\\vcruntime140.dll") ||
           std::filesystem::exists("C:\\Windows\\SysWOW64\\vcruntime140.dll")) ||
@@ -1031,6 +1225,9 @@ void Checks::installVCRedist()
 
     Helper::printSuccess("- VCRedist is installed", false);
     Helper::recordResult("VC Redist", "OK", "Installed successfully");
+    std::error_code ec;
+    std::filesystem::remove(vcX64Path, ec);
+    std::filesystem::remove(vcX86Path, ec);
     Helper::vcComplete = true;
 }
 
@@ -1200,9 +1397,15 @@ void Helper::applyPendingChanges()
 void Checks::checkSecureBoot()
 {
     SetConsoleTitleA("Checking Secure-Boot");
-    DWORD secbootStatus;
-    Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE,
+    DWORD secbootStatus = 0;
+    bool found = Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE,
         "SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State", "UEFISecureBootEnabled", &secbootStatus);
+
+    if (!found) {
+        Helper::printSuccess("- Secure-Boot state unknown (key not found, assumed disabled)", false);
+        Helper::recordResult("Secure Boot", "OK", "Unknown (key missing)");
+        return;
+    }
 
     if (secbootStatus == 0x00000000) {
         Helper::printSuccess("- Secure-Boot is disabled", false);
@@ -1365,7 +1568,14 @@ void Checks::checkWinver()
         Helper::recordResult("Winver", "FAIL", "Read failed");
         return;
     }
-    int build = std::stoi(buildStr);
+    int build = 0;
+    try {
+        build = std::stoi(buildStr);
+    } catch (...) {
+        Helper::printError("- Failed to parse Winver build number (Error 22)");
+        Helper::recordResult("Winver", "FAIL", "Parse failed: " + std::string(buildStr));
+        return;
+    }
 
     char productName[128] = ""; DWORD productSize = sizeof(productName);
     if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
@@ -1751,6 +1961,10 @@ void Helper::setupConsole()
     DWORD mode = 0;
     GetConsoleMode(hStdin, &mode);
     SetConsoleMode(hStdin, mode & ~(ENABLE_QUICK_EDIT_MODE | ENABLE_EXTENDED_FLAGS));
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD outMode = 0;
+    GetConsoleMode(hOut, &outMode);
+    SetConsoleMode(hOut, outMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
     SetConsoleTitleA("Initializing");
 }
 void Helper::printSuccess(const std::string& message, bool changed)
@@ -1824,13 +2038,9 @@ ServiceStatus Helper::getServiceStatus(LPCSTR serviceName)
 
 void Color::setBackgroundColor(const RGBColor& color) {
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    DWORD dwMode = 0; GetConsoleMode(hOut, &dwMode);
-    dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING; SetConsoleMode(hOut, dwMode);
     printf(("\x1b[48;2;" + std::to_string(color.r) + ";" + std::to_string(color.g) + ";" + std::to_string(color.b) + "m").c_str());
 }
 void Color::setForegroundColor(const RGBColor& color) {
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    DWORD dwMode = 0; GetConsoleMode(hOut, &dwMode);
-    dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING; SetConsoleMode(hOut, dwMode);
     printf(("\x1b[38;2;" + std::to_string(color.r) + ";" + std::to_string(color.g) + ";" + std::to_string(color.b) + "m").c_str());
 }

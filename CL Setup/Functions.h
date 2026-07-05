@@ -53,6 +53,7 @@ enum class ErrorCode {
     E32_FastBoot_Open = 32,
     E33_Defender_Tamper = 33,
     E34_AV_Tamper = 34,
+    E35_UAC_RegOpen = 35, E36_WU_Service = 36, E37_AntiCheat_Reg = 37,
 };
 
 struct CLIConfig {
@@ -103,6 +104,11 @@ namespace Checks {
     void checkVM();
     void checkForUpdate();
     void checkSecurityMitigations();
+    void checkUAC();
+    void checkWindowsUpdate();
+    void checkAntiCheat();
+    void createRestorePoint();
+    void backupRegistryKey(const std::string& key, const std::string& label);
 }
 namespace Helper {
     extern bool restartRequired;

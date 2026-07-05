@@ -140,10 +140,26 @@ int main(int argc, char* argv[])
     if (!Helper::isCheckSkipped(22)) Checks::checkForUpdate();
     else { Helper::printConcern("- Skipped: Auto-Update"); Helper::recordResult("Auto-Update", "SKIPPED", ""); }
 
+    if (!Helper::isCheckSkipped(25)) Checks::checkUAC();
+    else { Helper::printConcern("- Skipped: UAC"); Helper::recordResult("UAC", "SKIPPED", ""); }
+
+    if (!Helper::isCheckSkipped(26)) Checks::checkWindowsUpdate();
+    else { Helper::printConcern("- Skipped: Windows Update"); Helper::recordResult("Windows Update", "SKIPPED", ""); }
+
+    if (!Helper::isCheckSkipped(27)) Checks::checkAntiCheat();
+    else { Helper::printConcern("- Skipped: Anti-Cheat"); Helper::recordResult("Anti-Cheat", "SKIPPED", ""); }
+
     Color::setForegroundColor(Color::LightGray);
     std::cout << "-----------------------------------------------------------------\n";
     Color::setForegroundColor(Color::Cyan);
     std::cout << "Initial checks completed. No changes have been applied yet.\n";
+
+    int warningsCount = 0;
+    int failuresCount = 0;
+    for (auto& r : Helper::g_results) {
+        if (r.status == "WARN") warningsCount++;
+        else if (r.status == "FAIL") failuresCount++;
+    }
 
     bool changesApplied = false;
 
@@ -156,7 +172,7 @@ int main(int argc, char* argv[])
 
         bool shouldApply = true;
         if (!Helper::cliConfig.headless) {
-            int result = MessageBoxA(NULL, "Do you want to apply the pending changes?", "CL-Setup",
+            int result = MessageBoxA(GetConsoleWindow(), "Do you want to apply the pending changes?", "CL-Setup",
                 MB_YESNO | MB_ICONQUESTION | MB_TOPMOST);
             if (result == IDNO) {
                 shouldApply = false;
@@ -166,6 +182,14 @@ int main(int argc, char* argv[])
         }
 
         if (shouldApply) {
+            Color::setForegroundColor(Color::Cyan);
+            std::cout << "Creating restore point and backing up registry...\n";
+            Color::setForegroundColor(Color::LightGray);
+            Checks::createRestorePoint();
+            Checks::backupRegistryKey("HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\Microsoft\\Windows Defender", "DefenderPolicies");
+            Checks::backupRegistryKey("HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\DeviceGuard", "DeviceGuard");
+            Checks::backupRegistryKey("HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate", "WindowsUpdate");
+            std::cout << "-----------------------------------------------------------------\n";
             Color::setForegroundColor(Color::Cyan);
             std::cout << "Applying approved changes...\n";
             Color::setForegroundColor(Color::LightGray);
@@ -207,10 +231,21 @@ int main(int argc, char* argv[])
         if (!Helper::isCheckSkipped(17)) Checks::checkCoreIsolation();
         if (!Helper::isCheckSkipped(18)) Checks::checkDMAProtection();
         if (!Helper::isCheckSkipped(24)) Checks::checkSecurityMitigations();
+        if (!Helper::isCheckSkipped(25)) Checks::checkUAC();
+        if (!Helper::isCheckSkipped(26)) Checks::checkWindowsUpdate();
+        if (!Helper::isCheckSkipped(27)) Checks::checkAntiCheat();
     }
 
     Color::setForegroundColor(Color::LightGray);
     std::cout << "-----------------------------------------------------------------\n";
+
+    warningsCount = 0;
+    failuresCount = 0;
+    for (auto& r : Helper::g_results) {
+        if (r.status == "WARN") warningsCount++;
+        else if (r.status == "FAIL") failuresCount++;
+    }
+
     Color::setForegroundColor(Color::Cyan);
     std::cout << "Successfully ran all checks, feel free to close the application\n";
     Color::setForegroundColor(Color::Green);
@@ -218,6 +253,14 @@ int main(int argc, char* argv[])
     if (Helper::restartRequired) {
         Color::setForegroundColor(Color::Red);
         std::cout << "\n(Restart required to apply all changes)";
+    }
+    if (failuresCount > 0) {
+        Color::setForegroundColor(Color::Red);
+        std::cout << "\n(" << failuresCount << " failures found)";
+    }
+    if (warningsCount > 0) {
+        Color::setForegroundColor(Color::Yellow);
+        std::cout << "\n(" << warningsCount << " warnings)";
     }
 
     std::cout << "\n";
@@ -234,5 +277,7 @@ int main(int argc, char* argv[])
         std::cin.get();
     }
 
+    if (failuresCount > 0) return 2;
+    if (warningsCount > 0) return 1;
     return 0;
 }
