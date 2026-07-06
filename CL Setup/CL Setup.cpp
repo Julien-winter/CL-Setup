@@ -45,7 +45,8 @@ int main(int argc, char* argv[])
         Sleep(1500);
     }
 
-    Helper::g_phase = 1;
+    // Phase 1: Check only, no writes
+    Helper::applyChanges = false;
 
     std::vector<std::thread> parallelChecks;
 
@@ -128,17 +129,17 @@ int main(int argc, char* argv[])
     if (!Helper::isCheckSkipped(20)) Checks::checkInternet();
     else { Helper::printConcern("- Skipped: Internet"); Helper::recordResult("Internet", "SKIPPED", ""); }
 
-    if (!Helper::isCheckSkipped(23)) Checks::checkNetworkAdapters();
+    if (!Helper::isCheckSkipped(21)) Checks::checkNetworkAdapters();
     else { Helper::printConcern("- Skipped: Network Adapters"); Helper::recordResult("Network Adapters", "SKIPPED", ""); }
+
+    if (!Helper::isCheckSkipped(22)) Checks::checkVM();
+    else { Helper::printConcern("- Skipped: VM Detection"); Helper::recordResult("VM Detection", "SKIPPED", ""); }
+
+    if (!Helper::isCheckSkipped(23)) Checks::checkForUpdate();
+    else { Helper::printConcern("- Skipped: Auto-Update"); Helper::recordResult("Auto-Update", "SKIPPED", ""); }
 
     if (!Helper::isCheckSkipped(24)) Checks::checkSecurityMitigations();
     else { Helper::printConcern("- Skipped: Security Mitigations"); Helper::recordResult("Security Mitigations", "SKIPPED", ""); }
-
-    if (!Helper::isCheckSkipped(21)) Checks::checkVM();
-    else { Helper::printConcern("- Skipped: VM Detection"); Helper::recordResult("VM Detection", "SKIPPED", ""); }
-
-    if (!Helper::isCheckSkipped(22)) Checks::checkForUpdate();
-    else { Helper::printConcern("- Skipped: Auto-Update"); Helper::recordResult("Auto-Update", "SKIPPED", ""); }
 
     if (!Helper::isCheckSkipped(25)) Checks::checkUAC();
     else { Helper::printConcern("- Skipped: UAC"); Helper::recordResult("UAC", "SKIPPED", ""); }
@@ -151,92 +152,72 @@ int main(int argc, char* argv[])
     Color::setForegroundColor(Color::Cyan);
     std::cout << "Initial checks completed. No changes have been applied yet.\n";
 
-    int warningsCount = 0;
-    int failuresCount = 0;
-    for (auto& r : Helper::g_results) {
-        if (r.status == "WARN") warningsCount++;
-        else if (r.status == "FAIL") failuresCount++;
-    }
-
     bool changesApplied = false;
 
-    if (!Helper::pendingChanges.empty()) {
-        std::cout << "\nPending changes:\n";
-        for (auto& pc : Helper::pendingChanges) {
-            std::cout << " - " << pc << "\n";
-        }
-        std::cout << "\n";
+    if (Helper::hasPendingChanges()) {
+        Color::setForegroundColor(Color::LightGray);
+        std::cout << "-----------------------------------------------------------------\n";
 
-        bool shouldApply = true;
-        if (!Helper::cliConfig.headless) {
-            int result = MessageBoxA(GetConsoleWindow(), "Do you want to apply the pending changes?", "CL-Setup",
-                MB_YESNO | MB_ICONQUESTION | MB_TOPMOST);
-            if (result == IDNO) {
-                shouldApply = false;
-                Color::setForegroundColor(Color::Cyan);
-                std::cout << "Changes skipped by user.\n" << std::endl;
-            }
-        }
-
-        if (shouldApply) {
+        bool approved = Helper::cliConfig.autoApply || Helper::promptApplyChanges();
+        if (approved) {
             Color::setForegroundColor(Color::Cyan);
-            std::cout << "Creating restore point and backing up registry...\n";
+            std::cout << "\nCreating restore point and backing up registry...\n";
             Color::setForegroundColor(Color::LightGray);
             Checks::createRestorePoint();
             Checks::backupRegistryKey("HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\Microsoft\\Windows Defender", "DefenderPolicies");
             Checks::backupRegistryKey("HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\DeviceGuard", "DeviceGuard");
             Checks::backupRegistryKey("HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate", "WindowsUpdate");
-            std::cout << "-----------------------------------------------------------------\n";
+
+            Helper::applyChanges = true;
+            Helper::clearPendingChanges();
+            Helper::clearResults();
+            changesApplied = true;
+
             Color::setForegroundColor(Color::Cyan);
-            std::cout << "Applying approved changes...\n";
+            std::cout << "\nApplying approved changes...\n";
             Color::setForegroundColor(Color::LightGray);
             std::cout << "-----------------------------------------------------------------\n";
 
-            Helper::g_phase = 2;
-            Helper::applyPendingChanges();
-            changesApplied = true;
+            // Phase 2: Apply changes
+            std::vector<std::thread> applyParallel;
+            if (!Helper::isCheckSkipped(1)) {
+                applyParallel.emplace_back([]() { Checks::checkWindowsDefender(); });
+            }
+            if (!Helper::isCheckSkipped(2)) {
+                applyParallel.emplace_back([]() { Checks::check3rdPartyAntiVirus(); });
+            }
+            if (!Helper::isCheckSkipped(7)) {
+                applyParallel.emplace_back([]() { Checks::isChromeInstalled(); });
+            }
+            for (auto& t : applyParallel) t.join();
+            applyParallel.clear();
+
+            if (!Helper::isCheckSkipped(4)) Checks::checkCPUV();
+            if (!Helper::isCheckSkipped(5)) Checks::checkRiotVanguard();
+            if (!Helper::isCheckSkipped(6)) Checks::installVCRedist();
+            if (!Helper::isCheckSkipped(8)) Checks::disableChromeProtection();
+            if (!Helper::isCheckSkipped(9)) Checks::syncWindowsTime();
+            if (!Helper::isCheckSkipped(11)) Checks::deleteSymbols();
+            if (!Helper::isCheckSkipped(12)) Checks::checkFastBoot();
+            if (!Helper::isCheckSkipped(13)) Checks::checkExploitProtection();
+            if (!Helper::isCheckSkipped(14)) Checks::checkSmartScreen();
+            if (!Helper::isCheckSkipped(15)) Checks::checkGameBar();
+            if (!Helper::isCheckSkipped(17)) Checks::checkCoreIsolation();
+            if (!Helper::isCheckSkipped(20)) Checks::checkInternet();
+            if (!Helper::isCheckSkipped(24)) Checks::checkSecurityMitigations();
+            if (!Helper::isCheckSkipped(25)) Checks::checkUAC();
+            if (!Helper::isCheckSkipped(26)) Checks::checkWindowsUpdate();
         }
-    }
-
-    if (changesApplied) {
-        Helper::g_phase = 3;
-
-        std::vector<std::thread> parallelChecks2;
-
-        if (!Helper::isCheckSkipped(1)) {
-            parallelChecks2.emplace_back([]() { Checks::checkWindowsDefender(); });
+        else {
+            Helper::printConcern("- User declined changes. Leaving system unchanged.");
         }
-        if (!Helper::isCheckSkipped(2)) {
-            parallelChecks2.emplace_back([]() { Checks::check3rdPartyAntiVirus(); });
-        }
-        if (!Helper::isCheckSkipped(7)) {
-            parallelChecks2.emplace_back([]() { Checks::isChromeInstalled(); });
-        }
-
-        for (auto& t : parallelChecks2) t.join();
-        parallelChecks2.clear();
-
-        if (!Helper::isCheckSkipped(3)) Checks::checkSecureBoot();
-        if (!Helper::isCheckSkipped(4)) Checks::checkCPUV();
-        if (!Helper::isCheckSkipped(5)) Checks::checkRiotVanguard();
-        if (!Helper::isCheckSkipped(6)) Checks::checkVCRedist();
-        if (!Helper::isCheckSkipped(8)) Checks::disableChromeProtection();
-        if (!Helper::isCheckSkipped(12)) Checks::checkFastBoot();
-        if (!Helper::isCheckSkipped(13)) Checks::checkExploitProtection();
-        if (!Helper::isCheckSkipped(14)) Checks::checkSmartScreen();
-        if (!Helper::isCheckSkipped(15)) Checks::checkGameBar();
-        if (!Helper::isCheckSkipped(17)) Checks::checkCoreIsolation();
-        if (!Helper::isCheckSkipped(18)) Checks::checkDMAProtection();
-        if (!Helper::isCheckSkipped(24)) Checks::checkSecurityMitigations();
-        if (!Helper::isCheckSkipped(25)) Checks::checkUAC();
-        if (!Helper::isCheckSkipped(26)) Checks::checkWindowsUpdate();
     }
 
     Color::setForegroundColor(Color::LightGray);
     std::cout << "-----------------------------------------------------------------\n";
 
-    warningsCount = 0;
-    failuresCount = 0;
+    int warningsCount = 0;
+    int failuresCount = 0;
     for (auto& r : Helper::g_results) {
         if (r.status == "WARN") warningsCount++;
         else if (r.status == "FAIL") failuresCount++;
