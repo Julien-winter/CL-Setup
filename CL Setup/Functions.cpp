@@ -84,8 +84,16 @@ bool Helper::promptApplyChanges()
         return false;
     }
 
-    int choice = MessageBoxA(NULL,
-        "The checker found changes that may be needed.\n\nApply these changes now?",
+    std::string msg = "The checker found changes that may be needed:\n\n";
+    {
+        std::lock_guard<std::mutex> lock(g_pendingChangesMutex);
+        for (const auto& change : g_pendingChanges) {
+            msg += "  \x95 " + change + "\n";
+        }
+    }
+    msg += "\nApply these changes now?";
+
+    int choice = MessageBoxA(NULL, msg.c_str(),
         "Apply setup changes?",
         MB_YESNO | MB_ICONQUESTION | MB_TOPMOST);
     if (choice == IDYES) return true;
@@ -227,15 +235,15 @@ void Helper::showHelp()
     std::cout << "  --quiet             Only show errors and warnings\n";
     std::cout << "  --apply             Apply needed changes without prompting\n";
     std::cout << "  --export FILE       Export results as JSON to FILE\n";
-    std::cout << "  --skip N[,M,...]    Skip specific checks by number (1-26)\n";
-    std::cout << "  --only N[,M,...]    Run only specific checks by number (1-26)\n\n";
+    std::cout << "  --skip N[,M,...]    Skip specific checks by number (1-25)\n";
+    std::cout << "  --only N[,M,...]    Run only specific checks by number (1-25)\n\n";
     std::cout << "Check Numbers:\n";
-    std::cout << "  1=WindowsDefender 2=3rdPartyAV 3=SecureBoot 4=CPU-V 5=RiotVanguard\n";
-    std::cout << "  6=VCRedist 7=Chrome 8=ChromeProtection 9=TimeSync 10=Winver\n";
-    std::cout << "  11=Symbols 12=FastBoot 13=ExploitProtection 14=SmartScreen\n";
-    std::cout << "  15=GameBar 16=TPM 17=CoreIsolation 18=DMAProtection 19=ModifiedOS\n";
-    std::cout << "  20=Internet 21=NetworkAdapters 22=VM-Detect 23=Auto-Update\n";
-    std::cout << "  24=SecurityMitigations 25=UAC 26=WindowsUpdate\n";
+    std::cout << "  1=WindowsDefender 2=3rdPartyAV 3=SecureBoot 4=RiotVanguard\n";
+    std::cout << "  5=VCRedist 6=Chrome 7=ChromeProtection 8=TimeSync 9=Winver\n";
+    std::cout << "  10=Symbols 11=FastBoot 12=ExploitProtection 13=SmartScreen\n";
+    std::cout << "  14=GameBar 15=TPM 16=CoreIsolation 17=DMAProtection 18=ModifiedOS\n";
+    std::cout << "  19=Internet 20=NetworkAdapters 21=VM-Detect 22=Auto-Update\n";
+    std::cout << "  23=SecurityMitigations 24=UAC 25=WindowsUpdate\n";
 }
 
 CLIConfig Helper::parseCLI(int argc, char* argv[])
@@ -1177,48 +1185,6 @@ void Checks::check3rdPartyAntiVirus()
     }
 
     Helper::recordResult("3rd Party AV", "OK", "None detected");
-}
-
-void Checks::checkCPUV()
-{
-    SetConsoleTitleA("Checking CPUV-V");
-
-    auto runWMIC = [](const std::string& cmd) -> std::string {
-        std::string fullCmd = cmd + " 2>nul";
-        std::FILE* pipe = _popen(fullCmd.c_str(), "r");
-        if (!pipe) {
-            if (!Helper::requestChange("Enable WMIC optional feature for CPU virtualization detection")) {
-                return std::string("ERROR");
-            }
-            Helper::runSystemCommand("dism /online /enable-feature /featurename:WMIC /quiet /norestart 2>nul");
-            Sleep(500);
-            pipe = _popen(fullCmd.c_str(), "r");
-        }
-        if (!pipe) return "ERROR";
-        char buffer[256]; std::string result;
-        while (std::fgets(buffer, 256, pipe)) result += buffer;
-        _pclose(pipe);
-        return result;
-    };
-
-    std::string result = runWMIC("WMIC CPU Get VirtualizationFirmwareEnabled");
-    if (result == "ERROR") {
-        Helper::printConcern("- WMIC not available - possible modified OS");
-        Helper::recordResult("CPU-V", "WARN", "WMIC not available");
-        return;
-    }
-
-    std::string lowerResult = result;
-    std::transform(lowerResult.begin(), lowerResult.end(), lowerResult.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-
-    if (lowerResult.find("true") != std::string::npos) {
-        Helper::printConcern("- CPU-V is enabled in BIOS. Consider disabling in BIOS if not needed");
-        Helper::recordResult("CPU-V", "WARN", "Enabled in BIOS");
-        return;
-    }
-
-    Helper::recordResult("CPU-V", "OK", "Disabled");
 }
 
 void Checks::uninstallRiotVanguard()
