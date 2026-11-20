@@ -22,6 +22,7 @@
 #include <mutex>
 #include <functional>
 #include <future>
+#include <unordered_set>
 #include <iphlpapi.h>
 #include <srrestoreptapi.h>
 #include "Functions.h"

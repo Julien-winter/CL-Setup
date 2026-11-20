@@ -3,6 +3,12 @@
     Undo-CL-Setup.ps1
     Reverts the changes made by CL Setup.
 
+    RUN THIS ONE FILE - no .bat helper needed:
+      right-click  ->  "Run with PowerShell"        (recommended)
+      or: powershell -NoProfile -ExecutionPolicy Bypass -File .\Undo-CL-Setup.ps1
+    It asks for administrator rights itself (UAC prompt) and stays open at the
+    end so you can read the result (pass -NoPause to skip the final "Press Enter").
+
     CL Setup appends every non-trivial change to:
         %LOCALAPPDATA%\CL-Setup\applied-changes.log
         markers:  backup:<subkey>|<exported .reg path>
@@ -25,22 +31,12 @@
       6. re-scans devices to bring removed virtual adapters back
       7. prints "info:" entries that cannot be reverted automatically
 
-    Run as administrator (Undo-CL-Setup.bat will elevate for you).
     A reboot is recommended when finished.
 #>
+param([switch]$NoPause)
 
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
-
-# ---------------------------------------------------------------- admin check
-$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$principal = New-Object Security.Principal.WindowsPrincipal($identity)
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Host "Administrator rights are required - re-launching elevated..." -ForegroundColor Yellow
-    Start-Process powershell.exe -Verb RunAs -ArgumentList `
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`""
-    exit 0
-}
 
 # ---------------------------------------------------------------- helpers
 function Write-Step([string]$text) {
@@ -52,6 +48,32 @@ function Write-Warn([string]$text) { Write-Host "  [!] $text" -ForegroundColor Y
 function Write-Fail([string]$text) {
     Write-Host "  [x] $text" -ForegroundColor Red
     $script:failures++
+}
+# Keeps the window open so the user can read the outcome (a double-clicked
+# window would close instantly on exit) - the old .bat provided the "pause".
+function Stop-Undo([int]$code) {
+    if (-not $NoPause) {
+        Write-Host ""
+        try { $null = Read-Host "Press Enter to close" } catch { }
+    }
+    exit $code
+}
+
+# ---------------------------------------------------------------- admin check
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "Administrator rights are required - re-launching elevated..." -ForegroundColor Yellow
+    $elevArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
+    if ($NoPause) { $elevArgs += '-NoPause' }
+    try {
+        Start-Process powershell.exe -Verb RunAs -ArgumentList $elevArgs
+        exit 0
+    }
+    catch {
+        Write-Host "  [x] Elevation was cancelled - cannot undo without admin rights." -ForegroundColor Red
+        Stop-Undo 1
+    }
 }
 
 # Every registry value CL Setup writes: key -> list of {Sub = extra path under
@@ -96,6 +118,9 @@ $regWrites = [ordered]@{
 
 # Remove tool-written values that the backup does not contain.
 # $BackupText = $null  -> remove every known value (key was created by the tool)
+# v1.2.2 bugfix: search ONLY inside the section of the target key+subkey - the
+# old whole-file match saw e.g. "Locked" from Scenarios\HypervisorEnforcedCodeIntegrity
+# inside a DeviceGuard export and then never removed the tool's DeviceGuard\Locked
 function Remove-ToolValues {
     param([string]$Key, [string]$BackupText)
 
@@ -107,7 +132,14 @@ function Remove-ToolValues {
 
         $inBackup = $false
         if ($BackupText) {
-            $inBackup = $BackupText -match ('"' + [regex]::Escape($entry.Name) + '"')
+            $sectionName = "HKEY_LOCAL_MACHINE\$Key$($entry.Sub)"
+            # .reg export: [HKEY_LOCAL_MACHINE\...] sections, optional quotes,
+            # values until the next section header
+            $pattern = '(?ims)^\["?]?' + [regex]::Escape($sectionName) + '["?]?\](.*?)(?=^\["?]?\[?HKEY_|\z)'
+            $m = [regex]::Match($BackupText, $pattern)
+            if ($m.Success) {
+                $inBackup = $m.Groups[1].Value -match ('"' + [regex]::Escape($entry.Name) + '"')
+            }
         }
         if ($inBackup) { continue }             # backup already restored the original
 
@@ -132,7 +164,7 @@ if (Test-Path -LiteralPath $changeLog) {
 }
 if ($lines.Count -eq 0 -and -not (Test-Path -LiteralPath $adapterLog)) {
     Write-Host "No CL Setup changes recorded - nothing to undo." -ForegroundColor Yellow
-    exit 0
+    Stop-Undo 0
 }
 
 Write-Host "CL Setup - Undo" -ForegroundColor Cyan
@@ -182,9 +214,21 @@ else {
             # exact name match: <KeyPath_underscored>_<YYYYMMDD-HHMMSS>.reg
             # (a plain glob would also match longer keys with the same prefix,
             #  e.g. ...\DeviceGuard matching ...\DeviceGuard\Scenarios\...)
+            # v1.2.2 fix: the pattern demanded 7 digits after the dash but CL Setup
+            # writes HHMMSS (6) - the fallback never matched before
             $old = Get-ChildItem -Path 'C:\Windows\Temp' -Filter "$keyName`_*.reg" -File -ErrorAction SilentlyContinue |
-                   Where-Object { $_.BaseName -match ('^' + [regex]::Escape($keyName) + '_\d{8}-\d{7}$') } |
+                   Where-Object { $_.BaseName -match ('^' + [regex]::Escape($keyName) + '_\d{8}-\d{6}$') } |
                    Sort-Object Name | Select-Object -First 1
+            # v1.2.2 fix: never take a fallback NEWER than the recorded pre-change
+            # backup - a later run's backup already contains this run's changes and
+            # would then be imported as "original state"
+            if ($old -and $backupPath -and $backupPath -match '_(\d{8}-\d{6})\.reg$') {
+                $recordedTs = $Matches[1]
+                if ($old.BaseName -match '_(\d{8}-\d{6})$' -and $Matches[1] -gt $recordedTs) {
+                    Write-Warn "recorded backup missing and newer fallback rejected: $($old.Name)"
+                    $old = $null
+                }
+            }
             if ($old) {
                 if ($backupPath) { Write-Warn "recorded backup missing, using oldest available: $($old.Name)" }
                 $backupPath = $old.FullName
@@ -264,11 +308,27 @@ if ($lines -contains 'service:WinDefend=disabled') {
     Write-Warn "the Defender policy values are removed in the Registry section above"
 }
 
-if ($lines -contains 'service:W32Time=auto') {
+# v1.2.2 bugfix: marker now carries the original start type
+# ("service:W32Time=was4" = was disabled, "=was3" = was manual/demand, ...).
+# The old marker "service:W32Time=auto" is still accepted (maps to demand).
+$w32Marker = $lines | Where-Object { $_ -like 'service:W32Time=*' } | Select-Object -First 1
+if ($w32Marker) {
     Write-Step "Windows Time service"
-    & sc.exe config W32Time start= demand | Out-Null
+    $original = ($w32Marker -split '=', 2)[1]
+    $target = 'demand'
+    if ($original -like 'was*') {
+        switch ($original.Substring(3)) {
+            '0' { $target = 'boot' }
+            '1' { $target = 'system' }
+            '2' { $target = 'auto' }
+            '3' { $target = 'demand' }
+            '4' { $target = 'disabled' }
+            default { $target = 'demand' }
+        }
+    }
+    & sc.exe config W32Time start= $target | Out-Null
     if ($LASTEXITCODE -eq 0) {
-        Write-Ok "W32Time start type set back to manual"
+        Write-Ok "W32Time start type set back to '$target' (original state)"
     }
     else {
         Write-Fail "could not change the W32Time start type"
@@ -302,7 +362,10 @@ if ($infos.Count -gt 0) {
 Write-Host ""
 if ($script:failures -eq 0) {
     Write-Host "Undo finished successfully. A reboot is recommended." -ForegroundColor Green
-    Write-Host "(A system restore point created by CL Setup is also still available.)" -ForegroundColor DarkGray
+    # v1.2.2 fix: only claim a restore point when the tool actually logged one
+    if ($lines -contains 'restorepoint:created') {
+        Write-Host "(A system restore point created by CL Setup is also still available.)" -ForegroundColor DarkGray
+    }
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     if (Test-Path -LiteralPath $changeLog) {
         Move-Item -LiteralPath $changeLog -Destination "$changeLog.undone-$stamp" -Force
@@ -315,6 +378,6 @@ if ($script:failures -eq 0) {
 else {
     Write-Host "Undo finished with $script:failures problem(s) - see messages above." -ForegroundColor Red
     Write-Host "The change logs were kept so you can run this script again." -ForegroundColor Yellow
-    exit 1
+    Stop-Undo 1
 }
-exit 0
+Stop-Undo 0

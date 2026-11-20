@@ -15,9 +15,12 @@ namespace Helper {
     std::vector<std::string> g_pendingChanges;
     std::mutex g_pendingChangesMutex;
     bool applyChanges = false;
+    // v1.2.2: every console line is printed at most once per run - the apply
+    // phase re-runs checks and must not repeat unchanged status lines
+    std::unordered_set<std::string> g_printedLines;
     std::string g_repoUrl = "Julien-winter/CL-Setup";
     std::string g_appName = "CL-Setup";
-    std::string g_appVersion = "1.2.2";
+    std::string g_appVersion = "1.2.3";
     int g_exitCode = 0;
 }
 
@@ -269,6 +272,8 @@ namespace {
         bool valid = false;
         int smbiosMajor = 0;
         int smbiosMinor = 0;
+        std::string biosVendor;      // Type 0 (v1.2.2)
+        std::string biosVersion;     // Type 0 (v1.2.2)
         std::string systemManufacturer;
         std::string systemProduct;
         std::string systemVersion;
@@ -279,6 +284,7 @@ namespace {
         std::string boardSerial;
         std::string uuidText;
         bool uuidNil = false;
+        bool uuidSameByte = false;   // e.g. 11111111-1111-... (v1.2.2)
     };
 
     std::string formatSmbiosUuid(const BYTE* bytes)
@@ -347,7 +353,12 @@ namespace {
                 return strings[index];
             };
 
-            if (type == 1 && formattedLength >= 0x18) {
+            if (type == 0 && formattedLength >= 0x0A) {
+                // Type 0: BIOS vendor (string 0) + BIOS version (string 1)
+                identity.biosVendor = getString(0);
+                identity.biosVersion = getString(1);
+            }
+            else if (type == 1 && formattedLength >= 0x18) {
                 identity.valid = true;
                 identity.systemManufacturer = getString(0);
                 identity.systemProduct = getString(1);
@@ -357,11 +368,15 @@ namespace {
                 const BYTE* uuid = header + 8;
                 bool allZero = true;
                 bool allFF = true;
+                bool sameByte = true;
                 for (int i = 0; i < 16; i++) {
                     if (uuid[i] != 0x00) allZero = false;
                     if (uuid[i] != 0xFF) allFF = false;
+                    if (uuid[i] != uuid[0]) sameByte = false;
                 }
                 identity.uuidNil = allZero || allFF;
+                // e.g. 11111111-1111-1111-1111-111111111111 - synthetic, not OEM
+                identity.uuidSameByte = sameByte && !allZero && !allFF;
                 identity.uuidText = formatSmbiosUuid(uuid);
             }
             else if (type == 2 && formattedLength >= 8) {
@@ -499,6 +514,111 @@ namespace {
         l.resize(n, 0);
         return r > l;
     }
+
+    // v1.2.2: bounded command runner (bugfix: the old std::async/_popen "timeout"
+    // never fired - the future's destructor waited for the child, and
+    // runSystemCommand had no timeout at all, so a hung child froze the tool
+    // before the screenshot hint was even printed).
+    // - runs "cmd.exe /c <command>" (same command processor _popen used)
+    // - stdout captured, stderr inherited from the console (same as _popen)
+    // - breaks on PROCESS exit + drained pipe, not on pipe EOF, so a target that
+    //   inherits the pipe (e.g. `start https://...` launching a browser) cannot
+    //   stall the caller
+    // - on deadline the whole job tree is killed (cmd, powershell, dism, ...)
+    // Returns: 0 = finished, 1 = timed out (tree killed), -1 = launch failed.
+    int runBoundedCommand(const char* command, DWORD timeoutMs,
+        std::string* output, DWORD* exitCode)
+    {
+        if (command == NULL || command[0] == '\0') return -1;
+
+        SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
+        HANDLE outRead = NULL, outWrite = NULL;
+        if (!CreatePipe(&outRead, &outWrite, &sa, 0)) return -1;
+        // only the write end may be inherited by the child
+        SetHandleInformation(outRead, HANDLE_FLAG_INHERIT, 0);
+
+        STARTUPINFOA si;
+        ZeroMemory(&si, sizeof(si));
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        si.hStdOutput = outWrite;
+        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);  // same as _popen: console
+        si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+        std::string cmdLine = std::string("cmd.exe /c ") + command;
+        std::vector<char> clBuf(cmdLine.begin(), cmdLine.end());
+        clBuf.push_back('\0');
+
+        PROCESS_INFORMATION pi;
+        ZeroMemory(&pi, sizeof(pi));
+        BOOL created = CreateProcessA(NULL, clBuf.data(), NULL, NULL, TRUE,
+            0 /* keep parent console, like _popen - no extra window */, NULL, NULL, &si, &pi);
+        CloseHandle(outWrite); // parent copy - EOF comes when the child tree releases it
+        if (!created) { CloseHandle(outRead); return -1; }
+
+        // job object so a timeout kills the WHOLE tree (cmd -> powershell/dism/...)
+        // NOTE: no JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE - a normal close must leave
+        // surviving children (e.g. a browser launched via `start https://...`) alive
+        HANDLE job = CreateJobObjectA(NULL, NULL);
+        if (job != NULL) {
+            if (!AssignProcessToJobObject(job, pi.hProcess)) {
+                CloseHandle(job);
+                job = NULL;
+            }
+        }
+
+        std::string collected;
+        char tmp[4096];
+        const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+        bool childExited = false;
+        bool timedOut = false;
+
+        for (;;) {
+            // drain everything already in the pipe (never blocks)
+            DWORD avail = 0;
+            while (PeekNamedPipe(outRead, NULL, 0, NULL, &avail, NULL) && avail > 0) {
+                DWORD want = avail < sizeof(tmp) ? avail : sizeof(tmp);
+                DWORD got = 0;
+                if (!ReadFile(outRead, tmp, want, &got, NULL) || got == 0) break;
+                if (output != NULL) collected.append(tmp, got);
+            }
+
+            if (!childExited && WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) {
+                childExited = true;
+            }
+            if (childExited) {
+                // drain what was written before exit; PeekNamedPipe returns FALSE
+                // with ERROR_BROKEN_PIPE once all writers closed AND the buffer is
+                // empty - that means done (must NOT wait for the deadline here)
+                DWORD rest = 0;
+                if (!PeekNamedPipe(outRead, NULL, 0, NULL, &rest, NULL) || rest == 0) break;
+                if (GetTickCount64() > deadline) break;
+                continue;
+            }
+
+            if (GetTickCount64() >= deadline) {
+                timedOut = true;
+                if (job != NULL) TerminateJobObject(job, 1);
+                TerminateProcess(pi.hProcess, 1);
+                WaitForSingleObject(pi.hProcess, 2000);
+                break;
+            }
+            Sleep(20);
+        }
+
+        if (!timedOut && exitCode != NULL) {
+            DWORD code = 0;
+            if (GetExitCodeProcess(pi.hProcess, &code)) *exitCode = code;
+        }
+        if (output != NULL) output->swap(collected);
+
+        CloseHandle(outRead);
+        if (job != NULL) CloseHandle(job); // on timeout TerminateJobObject already killed the tree
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return timedOut ? 1 : 0;
+    }
 }
 
 void Helper::recordResult(const std::string& check, const std::string& status, const std::string& message)
@@ -509,9 +629,14 @@ void Helper::recordResult(const std::string& check, const std::string& status, c
     // instead of only the partial apply re-run ("17 passed" bug).
     for (auto& result : g_results) {
         if (result.check == check) {
+            bool unchanged = (result.status == status && result.message == message);
             result.status = status;
             result.message = message;
-            logWrite("  [" + status + "] " + check + " - " + message);
+            // v1.2.2: an unchanged re-run in the apply phase would only duplicate the
+            // log line - log again only when the result actually changed
+            if (!unchanged) {
+                logWrite("  [" + status + "] " + check + " - " + message + " (updated)");
+            }
             return;
         }
     }
@@ -621,8 +746,17 @@ void Helper::showShopInfo()
 
 bool Helper::promptApplyChanges()
 {
-    if (!hasPendingChanges()) return false;
-    printPendingChanges();
+    if (!hasPendingChanges()) {
+        // v1.2.2: no dialog without pending changes - but the promo box must
+        // still appear (it used to show after the dialog, which only existed
+        // because Time Sync always raised a pending change - that bug is fixed,
+        // so the box now shows here instead of vanishing with the dialog)
+        showShopInfo();
+        return false;
+    }
+    // v1.2.2: no console copy of the pending list - every item already printed
+    // its "- Change needed:" discovery line, and the dialog repeats them anyway
+    // (three copies used to stack up mid-screenshot)
 
     if (cliConfig.headless) {
         printConcern("- Headless mode: pending changes were not applied");
@@ -666,7 +800,15 @@ std::string Helper::escapeJSON(const std::string& s)
         case '\n': out += "\\n"; break;
         case '\r': out += "\\r"; break;
         case '\t': out += "\\t"; break;
-        default: out += c;
+        default:
+            // v1.2.2: remaining C0 control chars must be \u-escaped or the
+            // whole export becomes invalid JSON (0x1B from stripped ANSI etc.)
+            if (static_cast<unsigned char>(c) < 0x20) {
+                char buf[8];
+                snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+                out += buf;
+            }
+            else out += c;
         }
     }
     return out;
@@ -695,12 +837,22 @@ void Helper::exportResultsJSON()
         return;
     }
 
-    int passed = 0, failed = 0, warnings = 0, skipped = 0;
-    for (auto& r : g_results) {
+    // v1.2.2: snapshot under the results mutex (threaded checks may still record)
+    decltype(g_results) results;
+    {
+        std::lock_guard<std::mutex> lock(g_resultsMutex);
+        results = g_results;
+    }
+
+    int passed = 0, failed = 0, warnings = 0, skipped = 0, info = 0;
+    for (auto& r : results) {
         if (r.status == "OK") passed++;
         else if (r.status == "FAIL") failed++;
         else if (r.status == "WARN") warnings++;
         else if (r.status == "SKIPPED") skipped++;
+        // v1.2.2: INFO results (UAC, Windows Update) were not counted at all,
+        // so passed+failed+warnings+skipped never matched results.length
+        else if (r.status == "INFO") info++;
     }
 
     f << "{\n";
@@ -708,11 +860,11 @@ void Helper::exportResultsJSON()
     f << "  \"program\": \"" << escapeJSON(g_appName) << "\",\n";
     f << "  \"version\": \"" << escapeJSON(g_appVersion) << "\",\n";
     f << "  \"results\": [\n";
-    for (size_t i = 0; i < g_results.size(); i++) {
-        f << "    {\"check\": \"" << escapeJSON(g_results[i].check) << "\", "
-          << "\"status\": \"" << escapeJSON(g_results[i].status) << "\", "
-          << "\"message\": \"" << escapeJSON(g_results[i].message) << "\"}";
-        if (i < g_results.size() - 1) f << ",";
+    for (size_t i = 0; i < results.size(); i++) {
+        f << "    {\"check\": \"" << escapeJSON(results[i].check) << "\", "
+          << "\"status\": \"" << escapeJSON(results[i].status) << "\", "
+          << "\"message\": \"" << escapeJSON(results[i].message) << "\"}";
+        if (i < results.size() - 1) f << ",";
         f << "\n";
     }
     f << "  ],\n";
@@ -721,6 +873,7 @@ void Helper::exportResultsJSON()
     f << "    \"failed\": " << failed << ",\n";
     f << "    \"warnings\": " << warnings << ",\n";
     f << "    \"skipped\": " << skipped << ",\n";
+    f << "    \"info\": " << info << ",\n";
     f << "    \"restart_required\": " << (restartRequired ? "true" : "false") << "\n";
     f << "  }\n";
     f << "}\n";
@@ -732,9 +885,15 @@ void Helper::exportResultsJSON()
 std::string Helper::fetchURL(const std::wstring& url)
 {
     std::string result;
-    HINTERNET hSession = WinHttpOpen(L"CL-Setup/2.0",
+    // v1.2.2: version-correct User-Agent (was hardcoded "CL-Setup/2.0")
+    std::wstring agent = L"CL-Setup/" + std::wstring(g_appVersion.begin(), g_appVersion.end());
+    HINTERNET hSession = WinHttpOpen(agent.c_str(),
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return "";
+
+    // v1.2.2: short timeouts so a dead network cannot stall a check for minutes
+    // (used by the update check and the new internet HTTP fallback)
+    WinHttpSetTimeouts(hSession, 5000, 5000, 8000, 8000);
 
     URL_COMPONENTS urlComp;
     ZeroMemory(&urlComp, sizeof(urlComp));
@@ -799,6 +958,22 @@ void Helper::showHelp()
 CLIConfig Helper::parseCLI(int argc, char* argv[])
 {
     CLIConfig config;
+    // v1.2.2: only 1-28 are valid check ids; everything else is reported
+    auto parseIds = [](const std::string& val, std::vector<int>& dest, const char* flag) {
+        std::stringstream ss(val);
+        std::string token;
+        while (std::getline(ss, token, ',')) {
+            int id = -1;
+            try { id = std::stoi(token); } catch (...) { id = -1; }
+            if (id < 1 || id > 28) {
+                std::cout << "[!] Ignored invalid check number for " << flag
+                    << ": \"" << token << "\" (valid: 1-28)\n";
+                continue;
+            }
+            dest.push_back(id);
+        }
+    };
+
     for (int i = 1; i < argc; i++) {
         std::string arg(argv[i]);
         if (arg == "--help") {
@@ -814,27 +989,27 @@ CLIConfig Helper::parseCLI(int argc, char* argv[])
         else if (arg == "--apply") {
             config.autoApply = true;
         }
-        else if (arg == "--skip" && i + 1 < argc) {
-            std::string val(argv[++i]);
-            std::stringstream ss(val);
-            std::string token;
-            while (std::getline(ss, token, ',')) {
-                try { config.skipChecks.push_back(std::stoi(token)); }
-                catch (...) {}
-            }
+        else if (arg == "--skip") {
+            if (i + 1 < argc) parseIds(argv[++i], config.skipChecks, "--skip");
+            else std::cout << "[!] --skip needs a check number (1-28)\n";
         }
-        else if (arg == "--only" && i + 1 < argc) {
-            std::string val(argv[++i]);
-            std::stringstream ss(val);
-            std::string token;
-            while (std::getline(ss, token, ',')) {
-                try { config.onlyChecks.push_back(std::stoi(token)); }
-                catch (...) {}
-            }
+        else if (arg == "--only") {
+            if (i + 1 < argc) parseIds(argv[++i], config.onlyChecks, "--only");
+            else std::cout << "[!] --only needs a check number (1-28)\n";
         }
-        else if (arg == "--export" && i + 1 < argc) {
-            config.exportPath = argv[++i];
+        else if (arg == "--export") {
+            if (i + 1 < argc) config.exportPath = argv[++i];
+            else std::cout << "[!] --export needs a file path\n";
         }
+        else {
+            std::cout << "[!] Ignored unknown argument: " << arg << "\n";
+        }
+    }
+
+    // v1.2.2: --only wins over --skip - say so instead of silently dropping
+    if (!config.onlyChecks.empty() && !config.skipChecks.empty()) {
+        std::cout << "[!] Both --only and --skip given: --only takes precedence, --skip is ignored\n";
+        config.skipChecks.clear();
     }
 
     return config;
@@ -868,8 +1043,12 @@ bool Helper::isAdmin()
 
 void Helper::initLogging()
 {
-    wchar_t tempPath[MAX_PATH];
-    GetTempPathW(MAX_PATH, tempPath);
+    // v1.2.2: init + check - an uninitialized buffer would be used as path (UB)
+    wchar_t tempPath[MAX_PATH] = {};
+    DWORD tempLen = GetTempPathW(MAX_PATH, tempPath);
+    if (tempLen == 0 || tempLen >= MAX_PATH) {
+        wcscpy_s(tempPath, L"C:\\Windows\\Temp\\");
+    }
     std::wstring dir = std::wstring(tempPath) + L"CL-Setup";
     CreateDirectoryW(dir.c_str(), NULL);
 
@@ -878,8 +1057,10 @@ void Helper::initLogging()
     std::tm tm;
     localtime_s(&tm, &time);
     char filename[64];
-    snprintf(filename, sizeof(filename), "setup-%04d-%02d-%02d-%02d%02d.log",
-        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
+    // v1.2.2: seconds in the name - runs within the same minute used to append to
+    // the same file, so several runs (even different versions) ended up in one log
+    snprintf(filename, sizeof(filename), "setup-%04d-%02d-%02d-%02d%02d%02d.log",
+        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
 
     std::wstring logPath = dir + L"\\" + std::wstring(filename, filename + strlen(filename));
     int len = WideCharToMultiByte(CP_UTF8, 0, logPath.c_str(), -1, NULL, 0, NULL, NULL);
@@ -895,8 +1076,12 @@ void Helper::initLogging()
 
 void Helper::closeLogging()
 {
+    // v1.2.2: hold the log mutex while closing - a detached VCRedist thread
+    // could otherwise be inside logWrite() while the stream is closed
+    // (the final line is written directly: logWrite would re-lock the mutex)
+    std::lock_guard<std::mutex> lock(logMutex);
     if (logEnabled && logFile.is_open()) {
-        logWrite("=== " + g_appName + " finished ===");
+        logFile << "=== " + g_appName + " finished ===" << std::endl;
         logFile.close();
         logEnabled = false;
     }
@@ -904,31 +1089,24 @@ void Helper::closeLogging()
 
 void Helper::logWrite(const std::string& message)
 {
-    if (!logEnabled || !logFile.is_open()) return;
+    // v1.2.2: check inside the lock (the old check ran before it, so the file
+    // could be closed between check and write)
     std::lock_guard<std::mutex> lock(logMutex);
+    if (!logEnabled || !logFile.is_open()) return;
     logFile << message << std::endl;
     logFile.flush();
 }
 
 std::string Helper::runSystemCommandWithOutput(const char* command, DWORD timeoutMs)
 {
-    std::string commandText = command ? command : "";
-    auto future = std::async(std::launch::async, [commandText]() -> std::string {
-        std::FILE* pipe = _popen(commandText.c_str(), "r");
-        if (!pipe) return "";
-        char buffer[256];
-        std::string result;
-        while (std::fgets(buffer, sizeof(buffer), pipe) != NULL) {
-            result += buffer;
-        }
-        _pclose(pipe);
-        return result;
-    });
-
-    if (future.wait_for(std::chrono::milliseconds(timeoutMs)) == std::future_status::timeout) {
-        return "TIMEOUT";
-    }
-    return future.get();
+    if (command == NULL) return "";
+    // v1.2.2 bugfix: real deadline (the std::async version's future destructor
+    // blocked until the child exited - "TIMEOUT" could never appear early)
+    std::string output;
+    int rc = runBoundedCommand(command, timeoutMs, &output, NULL);
+    if (rc == 1) return "TIMEOUT";   // killed after deadline
+    if (rc < 0) return "";           // launch failed
+    return output;
 }
 
 void Helper::backupRegistryKey(HKEY hKeyParent, const std::string& subkey)
@@ -948,8 +1126,12 @@ void Helper::backupRegistryKey(HKEY hKeyParent, const std::string& subkey)
     HKEY hKey;
     if (RegOpenKeyEx(hKeyParent, subkey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) return;
 
-    wchar_t tempPath[MAX_PATH];
-    GetTempPathW(MAX_PATH, tempPath);
+    // v1.2.2: init + check (uninitialized path = UB, backups would land in CWD)
+    wchar_t tempPath[MAX_PATH] = {};
+    DWORD tempLen = GetTempPathW(MAX_PATH, tempPath);
+    if (tempLen == 0 || tempLen >= MAX_PATH) {
+        wcscpy_s(tempPath, L"C:\\Windows\\Temp\\");
+    }
     std::wstring dir = std::wstring(tempPath) + L"CL-Setup\\Backup";
     CreateDirectoryW(dir.c_str(), NULL);
 
@@ -997,6 +1179,39 @@ void Helper::logAppliedChange(const std::string& change)
     }
 }
 
+// v1.2.2: restore point as the FIRST action of the apply phase (before any
+// write), with visible failure and a marker the undo script can verify -
+// the old inline version ran after the first writes and swallowed all errors
+void Helper::createRestorePoint()
+{
+    HINSTANCE hSrDll = LoadLibraryA("srclient.dll");
+    if (hSrDll) {
+        typedef BOOL(WINAPI* SRSetRestorePointFn)(PRESTOREPOINTINFOW, PSTATEMGRSTATUS);
+        SRSetRestorePointFn SRSetRestorePoint = (SRSetRestorePointFn)GetProcAddress(hSrDll, "SRSetRestorePointW");
+        if (SRSetRestorePoint) {
+            RESTOREPOINTINFOW rp;
+            rp.dwEventType = BEGIN_SYSTEM_CHANGE;
+            rp.dwRestorePtType = MODIFY_SETTINGS;
+            rp.llSequenceNumber = 0;
+            std::wstring desc = L"CL-Setup v" + std::wstring(g_appVersion.begin(), g_appVersion.end()) + L" - Setup changes";
+            wcsncpy_s(rp.szDescription, desc.c_str(), _TRUNCATE);
+            STATEMGRSTATUS sms = {};
+            if (SRSetRestorePoint(&rp, &sms)) {
+                rp.dwEventType = END_SYSTEM_CHANGE;
+                SRSetRestorePoint(&rp, &sms);
+                printSuccess("- System Restore Point created", true);
+                logAppliedChange("restorepoint:created");
+                FreeLibrary(hSrDll);
+                return;
+            }
+        }
+        FreeLibrary(hSrDll);
+    }
+    // System Protection is disabled by default on many systems - say so instead
+    // of silently pretending a restore point exists (Undo used to claim that)
+    printConcern("- Could not create a restore point (System Protection may be disabled)");
+}
+
 ServiceStatus Helper::getServiceStatus(LPCSTR serviceName)
 {
     SC_HANDLE scmHandle = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
@@ -1017,6 +1232,7 @@ void Helper::printInfo(const std::string& message)
 {
     if (cliConfig.quiet) return;
     std::lock_guard<std::mutex> lock(consoleMutex);
+    if (!g_printedLines.insert(std::string("[i]") + message).second) return;
     Color::setForegroundColor(Color::LightGray);
     std::cout << "  " << message << std::endl;
 }
@@ -1025,12 +1241,24 @@ void Checks::checkInternet()
 {
     SetConsoleTitleA("Checking Internet Connection");
 
+    // v1.2.2: use the ping EXIT CODE (language-independent, "TTL=" parsing broke
+    // on localized output) and fall back to an HTTP probe when ICMP is blocked
+    // by a firewall - blocked ping does NOT mean no internet
     auto testPing = []() -> bool {
-        std::string out = Helper::runSystemCommandWithOutput("ping -n 1 -w 3000 8.8.8.8", 5000);
-        return (out.find("TTL=") != std::string::npos || out.find("ttl=") != std::string::npos);
+        int rc = Helper::runSystemCommandExitCode("ping -n 1 -w 3000 8.8.8.8");
+        return rc == 0;
     };
+    auto testHttp = []() -> bool {
+        std::string body = Helper::fetchURL(L"http://www.msftconnecttest.com/connecttest.txt");
+        if (body.empty()) body = Helper::fetchURL(L"https://www.msftconnecttest.com/connecttest.txt");
+        // v1.2.2 bugfix: `|| !body.empty()` subsumed the find - ANY answer
+        // (captive portal, error page) counted as online. Only the expected
+        // body of the Microsoft connect test proves connectivity.
+        return body.find("Microsoft Connect Test") != std::string::npos;
+    };
+    auto online = [&]() -> bool { return testPing() || testHttp(); };
 
-    if (testPing()) {
+    if (online()) {
         Helper::recordResult("Internet", "OK", "Connected");
         return;
     }
@@ -1046,7 +1274,7 @@ void Checks::checkInternet()
     Helper::logAppliedChange("info:network was repaired (DNS flush + Winsock reset) - a reboot may be required; the Winsock catalog was reset to Windows defaults");
     Sleep(1000);
 
-    if (testPing()) {
+    if (online()) {
         Helper::printSuccess("- Internet restored after DNS/Winsock reset", true);
         Helper::recordResult("Internet", "OK", "Fixed via DNS/Winsock reset");
         return;
@@ -1057,7 +1285,7 @@ void Checks::checkInternet()
     Helper::runSystemCommand("ipconfig /renew");
     Sleep(2000);
 
-    if (testPing()) {
+    if (online()) {
         Helper::printSuccess("- Internet restored after IP renew", true);
         Helper::recordResult("Internet", "OK", "Fixed via IP renew");
         return;
@@ -1331,37 +1559,29 @@ void Checks::checkSecurityMitigations()
         return value;
     };
 
-    if (Helper::applyChanges) {
-        HINSTANCE hSrDll = LoadLibraryA("srclient.dll");
-        if (hSrDll) {
-            typedef BOOL(WINAPI* SRSetRestorePointFn)(PRESTOREPOINTINFOW, PSTATEMGRSTATUS);
-            SRSetRestorePointFn SRSetRestorePoint = (SRSetRestorePointFn)GetProcAddress(hSrDll, "SRSetRestorePointW");
-            if (SRSetRestorePoint) {
-                RESTOREPOINTINFOW rp;
-                rp.dwEventType = BEGIN_SYSTEM_CHANGE;
-                rp.dwRestorePtType = MODIFY_SETTINGS;
-                rp.llSequenceNumber = 0;
-                std::wstring desc = L"CL-Setup v" + std::wstring(Helper::g_appVersion.begin(), Helper::g_appVersion.end()) + L" - Security mitigation changes";
-                wcsncpy_s(rp.szDescription, desc.c_str(), _TRUNCATE);
-                STATEMGRSTATUS sms;
-                if (SRSetRestorePoint(&rp, &sms)) {
-                    rp.dwEventType = END_SYSTEM_CHANGE;
-                    SRSetRestorePoint(&rp, &sms);
-                    Helper::printSuccess("- System Restore Point created", true);
-                }
-            }
-            FreeLibrary(hSrDll);
-        }
-    }
+    // v1.2.2: restore point moved out - it used to be created HERE, AFTER the
+    // setDword writes above, so it could not roll back those writes (see
+    // Helper::createRestorePoint, now called at the start of the apply phase)
 
     std::string bcdOutput = lower(Helper::runSystemCommandWithOutput("bcdedit /enum {current}", 5000));
+    // v1.2.2: evaluate ONLY the hypervisorlaunchtype line - searching the whole
+    // output for "off" false-matched other entries (e.g. "hypervisorlaunchtype"
+    // absent but some other line containing "off")
+    std::string hvLine;
+    {
+        size_t pos = bcdOutput.find("hypervisorlaunchtype");
+        if (pos != std::string::npos) {
+            size_t end = bcdOutput.find('\n', pos);
+            hvLine = bcdOutput.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+        }
+    }
     if (bcdOutput == "timeout" || bcdOutput.empty()) {
         Helper::printConcern("- Could not read hypervisor launch status");
         appendSummary("hypervisorlaunchtype=unknown");
         warning = true;
     }
-    else if (bcdOutput.find("hypervisorlaunchtype") != std::string::npos &&
-        bcdOutput.find("off") != std::string::npos) {
+    else if (!hvLine.empty() &&
+        (hvLine.find("off") != std::string::npos || hvLine.find("aus") != std::string::npos)) {
         Helper::printSuccess("- Hypervisor launch is already off", false);
         appendSummary("hypervisorlaunchtype=off");
     }
@@ -1373,47 +1593,91 @@ void Checks::checkSecurityMitigations()
             // pendings below are registered too, and so a result is always recorded
         }
         else {
-            Helper::runSystemCommand("bcdedit /set hypervisorlaunchtype off");
-            Helper::logAppliedChange("bcdedit:hypervisorlaunchtype=off");
-            Helper::printSuccess("- Set hypervisor launch type to off", true);
-            appendSummary("hypervisorlaunchtype=changed to off");
-            changed = true;
+            // v1.2.2: check the exit code - bcdedit needs admin rights and fails
+            // silently otherwise, which used to report a false "changed to off"
+            int rc = Helper::runSystemCommandExitCode("bcdedit /set hypervisorlaunchtype off");
+            if (rc == 0) {
+                Helper::logAppliedChange("bcdedit:hypervisorlaunchtype=off");
+                Helper::printSuccess("- Set hypervisor launch type to off", true);
+                appendSummary("hypervisorlaunchtype=changed to off");
+                changed = true;
+            }
+            else {
+                Helper::printError("- Failed to set hypervisor launch type (bcdedit exit " +
+                    std::to_string(rc) + ")");
+                appendSummary("hypervisorlaunchtype=failed");
+                failed = true;
+            }
         }
     }
 
     auto checkAndDisableFeature = [&](const std::string& featureName) {
-        std::string queryCommand = "dism /online /get-featureinfo /featurename:" + featureName + " 2>&1";
-        std::string output = lower(Helper::runSystemCommandWithOutput(queryCommand.c_str(), 15000));
-        if (output == "timeout" || output.empty()) {
-            Helper::printConcern("- Could not read Windows feature status: " + featureName);
-            appendSummary(featureName + "=unknown");
-            warning = true;
-            return;
+        // v1.2.2: ask PowerShell for the enum state first - DISM text output is
+        // localized ("State : Deaktiviert", "État : Activé", ...) and the old
+        // keyword matching only understood English + German
+        bool featureEnabled = false;
+        bool stateKnown = false;
+        {
+            std::string psCommand =
+                "powershell -NoProfile -NonInteractive -Command \""
+                "(Get-WindowsOptionalFeature -Online -FeatureName '" + featureName + "' -ErrorAction Stop).State\" 2>nul";
+            std::string psState = toLowerCopy(trimCopy(
+                Helper::runSystemCommandWithOutput(psCommand.c_str(), 20000)));
+            // v1.2.2 fix: psState is already lowercased - comparing to "TIMEOUT"
+            // could never match (the timeout case fell through to DISM text matching)
+            if (psState != "timeout" && psState != "time-out" && !psState.empty()) {
+                // "Disabled" / "Enabled" / "Enable Pending" / "Disable Pending" / "Absent"
+                if (psState.find("disabled") != std::string::npos ||
+                    psState.find("absent") != std::string::npos) {
+                    stateKnown = true; featureEnabled = false;
+                }
+                else if (psState.find("enabled") != std::string::npos) {
+                    stateKnown = true; featureEnabled = true;
+                }
+            }
         }
 
-        if (output.find("error") != std::string::npos ||
-            output.find("fehler") != std::string::npos ||
-            output.find("not found") != std::string::npos ||
-            output.find("nicht") != std::string::npos ||
-            output.find("0x800f") != std::string::npos) {
-            Helper::printSuccess("- Windows feature is not available: " + featureName, false);
-            appendSummary(featureName + "=disabled (not available)");
-            return;
+        if (!stateKnown) {
+            // fallback: localized DISM text matching (English + German + generic)
+            std::string queryCommand = "dism /online /get-featureinfo /featurename:" + featureName + " 2>&1";
+            std::string output = lower(Helper::runSystemCommandWithOutput(queryCommand.c_str(), 15000));
+            if (output == "timeout" || output.empty()) {
+                Helper::printConcern("- Could not read Windows feature status: " + featureName);
+                appendSummary(featureName + "=unknown");
+                warning = true;
+                return;
+            }
+
+            if (output.find("error") != std::string::npos ||
+                output.find("fehler") != std::string::npos ||
+                output.find("not found") != std::string::npos ||
+                output.find("nicht") != std::string::npos ||
+                output.find("0x800f") != std::string::npos) {
+                Helper::printSuccess("- Windows feature is not available: " + featureName, false);
+                appendSummary(featureName + "=disabled (not available)");
+                return;
+            }
+
+            if (output.find("state : disabled") != std::string::npos ||
+                output.find("state: disabled") != std::string::npos ||
+                output.find("deaktiviert") != std::string::npos) {
+                stateKnown = true; featureEnabled = false;
+            }
+            else if (output.find("state : enabled") != std::string::npos ||
+                output.find("state: enabled") != std::string::npos ||
+                output.find("aktiviert") != std::string::npos) {
+                stateKnown = true; featureEnabled = true;
+            }
+            else {
+                Helper::printInfo("Windows feature status is unclear (treated as disabled): " + featureName);
+                appendSummary(featureName + "=likely disabled");
+                return;
+            }
         }
 
-        if (output.find("state : disabled") != std::string::npos ||
-            output.find("state: disabled") != std::string::npos ||
-            output.find("deaktiviert") != std::string::npos) {
+        if (!featureEnabled) {
             Helper::printSuccess("- Windows feature is already disabled: " + featureName, false);
             appendSummary(featureName + "=disabled");
-            return;
-        }
-
-        if (output.find("state : enabled") == std::string::npos &&
-            output.find("state: enabled") == std::string::npos &&
-            output.find("aktiviert") == std::string::npos) {
-            Helper::printInfo("Windows feature status is unclear (treated as disabled): " + featureName);
-            appendSummary(featureName + "=likely disabled");
             return;
         }
 
@@ -1424,11 +1688,21 @@ void Checks::checkSecurityMitigations()
         }
 
         std::string disableCommand = "dism /online /disable-feature /featurename:" + featureName + " /norestart";
-        Helper::runSystemCommand(disableCommand.c_str());
-        Helper::printSuccess("- Disabled Windows feature: " + featureName, true);
-        Helper::logAppliedChange("dism:" + featureName);
-        appendSummary(featureName + "=changed to disabled");
-        changed = true;
+        // v1.2.2: check the exit code - DISM can fail (pending actions, servicing
+        // stack) and the old code reported success regardless
+        int rc = Helper::runSystemCommandExitCode(disableCommand.c_str());
+        if (rc == 0 || rc == 3010) { // 3010 = success, reboot required
+            Helper::printSuccess("- Disabled Windows feature: " + featureName, true);
+            Helper::logAppliedChange("dism:" + featureName);
+            appendSummary(featureName + "=changed to disabled");
+            changed = true;
+        }
+        else {
+            Helper::printError("- Failed to disable Windows feature " + featureName +
+                " (dism exit " + std::to_string(rc) + ")");
+            appendSummary(featureName + "=failed");
+            failed = true;
+        }
     };
 
     checkAndDisableFeature("Microsoft-Hyper-V-Hypervisor");
@@ -1467,12 +1741,46 @@ void Checks::checkVM()
         isVM = true; vmType = vmType.empty() ? "VirtualBox (ACPI)" : vmType + "/VBox-ACPI"; RegCloseKey(hKey);
     }
 
+    // v1.2.2: Hyper-V guest marker (VMGUID value only exists inside guests)
+    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Virtual Machine\\Guest\\Parameters",
+        0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        isVM = true; vmType = vmType.empty() ? "Hyper-V" : vmType + "/Hyper-V"; RegCloseKey(hKey);
+    }
+
     SC_HANDLE scm = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
     if (scm) {
-        if (OpenService(scm, "VBoxService", SERVICE_QUERY_STATUS)) {
+        // v1.2.2 bugfix: the service handle was never closed (handle leak per run)
+        SC_HANDLE vboxSvc = OpenService(scm, "VBoxService", SERVICE_QUERY_STATUS);
+        if (vboxSvc != NULL) {
             isVM = true; vmType = vmType.empty() ? "VirtualBox" : vmType;
+            CloseServiceHandle(vboxSvc);
         }
         CloseServiceHandle(scm);
+    }
+
+    // v1.2.2: firmware identifiers in the BIOS registry block - catches QEMU/KVM,
+    // Bochs, Xen, Parallels etc. that leave no service/registry marker behind
+    if (!isVM) {
+        std::string sysMan = toLowerCopy(trimCopy(readRegistryStringValue(HKEY_LOCAL_MACHINE,
+            "HARDWARE\\DESCRIPTION\\System\\BIOS", "SystemManufacturer")));
+        std::string sysProd = toLowerCopy(trimCopy(readRegistryStringValue(HKEY_LOCAL_MACHINE,
+            "HARDWARE\\DESCRIPTION\\System\\BIOS", "SystemProductName")));
+        std::string board = toLowerCopy(trimCopy(readRegistryStringValue(HKEY_LOCAL_MACHINE,
+            "HARDWARE\\DESCRIPTION\\System\\BIOS", "BaseBoardManufacturer")));
+        std::string blob = sysMan + " " + sysProd + " " + board;
+        struct VmHint { const char* needle; const char* label; };
+        static const VmHint hints[] = {
+            { "qemu", "QEMU/KVM" }, { "bochs", "Bochs" }, { "kvm", "KVM" },
+            { "xen", "Xen" }, { "parallels", "Parallels" },
+            { "virtual machine", "Hyper-V" }, { "virtualbox", "VirtualBox" },
+            { "vmware virtual", "VMware" }, { "innotek", "VirtualBox" },
+            { "vbox", "VirtualBox" }, { "bhyve", "bhyve" }, { "amazon ec2", "Nitro" },
+        };
+        for (const VmHint& hint : hints) {
+            if (blob.find(hint.needle) != std::string::npos) {
+                isVM = true; vmType = hint.label; break;
+            }
+        }
     }
 
     if (isVM) {
@@ -1490,8 +1798,10 @@ void Checks::checkForUpdate()
 
     // Cache path with repo-validated cache
     auto getUpdateCachePath = [&]() -> std::string {
-        char basePath[MAX_PATH];
-        GetEnvironmentVariableA("LOCALAPPDATA", basePath, MAX_PATH);
+        // v1.2.2: init + check - on failure the old code used garbage as path
+        char basePath[MAX_PATH] = {};
+        DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", basePath, MAX_PATH);
+        if (len == 0 || len >= MAX_PATH) return "";
         std::string dir = std::string(basePath) + "\\CL-Setup";
         CreateDirectoryA(dir.c_str(), NULL);
         return dir + "\\update-check.txt";
@@ -1594,7 +1904,8 @@ void Checks::checkForUpdate()
         Helper::recordResult("Auto-Update", "WARN", "New version: " + tag + (usedCache ? " (cached weekly check)" : ""));
     }
     else {
-        Helper::printSuccess("- No new updates (v" + Helper::g_appVersion + ")", false);
+        // v1.2.2: no console line when there is nothing to do - "No new updates"
+        // only showed noise (still recorded for log/JSON)
         Helper::recordResult("Auto-Update", "OK",
             "Up to date (v" + Helper::g_appVersion + ")" + (usedCache ? " - checked this week" : ""));
     }
@@ -1653,6 +1964,9 @@ void Checks::checkWindowsDefender()
     Helper::backupRegistryKey(HKEY_LOCAL_MACHINE, "SOFTWARE\\Policies\\Microsoft\\Windows Defender");
 
     if (checkDefenderTamperProtection()) {
+        // v1.2.2: record the check itself too - it used to vanish from the
+        // summary and the JSON export when Tamper Protection blocked it
+        Helper::recordResult("Windows Defender", "SKIPPED", "Blocked by Tamper Protection");
         return;
     }
 
@@ -1721,26 +2035,48 @@ void Checks::checkWindowsDefender()
         CloseServiceHandle(service);
     }
 
-    // Always set registry policies
-    HKEY hKey; DWORD val = 1;
-    RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SOFTWARE\\Policies\\Microsoft\\Windows Defender",
+    // Always set registry policies (v1.2.2: check every result - the old code
+    // reported "disabled (changed)" even when the writes failed, e.g. by policy)
+    HKEY hKey = NULL; DWORD val = 1;
+    bool policiesOk = true;
+    LONG ck = RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SOFTWARE\\Policies\\Microsoft\\Windows Defender",
         0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL);
-    RegSetValueEx(hKey, "DisableAntiSpyware", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
-    RegCloseKey(hKey);
+    if (ck != ERROR_SUCCESS) {
+        policiesOk = false;
+    }
+    else {
+        if (RegSetValueEx(hKey, "DisableAntiSpyware", 0, REG_DWORD, (BYTE*)&val, sizeof(val)) != ERROR_SUCCESS) {
+            policiesOk = false;
+        }
+        RegCloseKey(hKey);
+        hKey = NULL;
+    }
 
-    RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection",
+    ck = RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection",
         0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL);
-    RegSetValueEx(hKey, "DisableRealtimeMonitoring", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
-    RegSetValueEx(hKey, "DisableBehaviorMonitoring", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
-    RegSetValueEx(hKey, "DisableOnAccessProtection", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
-    RegSetValueEx(hKey, "DisableScanOnRealtimeEnable", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
-    RegCloseKey(hKey);
+    if (ck != ERROR_SUCCESS) {
+        policiesOk = false;
+    }
+    else {
+        if (RegSetValueEx(hKey, "DisableRealtimeMonitoring", 0, REG_DWORD, (BYTE*)&val, sizeof(val)) != ERROR_SUCCESS ||
+            RegSetValueEx(hKey, "DisableBehaviorMonitoring", 0, REG_DWORD, (BYTE*)&val, sizeof(val)) != ERROR_SUCCESS ||
+            RegSetValueEx(hKey, "DisableOnAccessProtection", 0, REG_DWORD, (BYTE*)&val, sizeof(val)) != ERROR_SUCCESS ||
+            RegSetValueEx(hKey, "DisableScanOnRealtimeEnable", 0, REG_DWORD, (BYTE*)&val, sizeof(val)) != ERROR_SUCCESS) {
+            policiesOk = false;
+        }
+        RegCloseKey(hKey);
+        hKey = NULL;
+    }
 
     // Undo-CL-Setup.ps1 re-enables the service from this marker
     Helper::logAppliedChange("service:WinDefend=disabled");
     Helper::logAppliedChange("reg:SOFTWARE\\Policies\\Microsoft\\Windows Defender");
 
-    if (serviceStopped) {
+    if (!policiesOk) {
+        Helper::printError("- Failed to set Windows Defender policy values (Error 25/26)");
+        Helper::recordResult("Windows Defender", "FAIL", "Policy write failed");
+    }
+    else if (serviceStopped) {
         Helper::printSuccess("- Windows Defender disabled (service + policy)", true);
         Helper::recordResult("Windows Defender", "OK", "Disabled (changed)");
     }
@@ -1785,7 +2121,9 @@ void Checks::check3rdPartyAntiVirus()
             std::string lowered = line;
             std::transform(lowered.begin(), lowered.end(), lowered.begin(),
                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            if (lowered.find("windows defender") != std::string::npos) continue;
+            // "Windows Defender" and the newer "Microsoft Defender Antivirus" display name
+            if (lowered.find("windows defender") != std::string::npos ||
+                lowered.find("microsoft defender") != std::string::npos) continue;
             if (antivirusList.find(line) != std::string::npos) continue;
 
             if (!antivirusList.empty()) antivirusList += ", ";
@@ -1877,6 +2215,7 @@ void Checks::check3rdPartyAntiVirus()
 
         // Try to auto-uninstall
         bool anyRemoved = false;
+        bool anyFailed = false;
         HKEY hKey;
         if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
             0, KEY_READ, &hKey) == ERROR_SUCCESS) {
@@ -1887,21 +2226,63 @@ void Checks::check3rdPartyAntiVirus()
                     char dn[256] = ""; DWORD dnSize = sizeof(dn);
                     RegQueryValueEx(hSubkey, "DisplayName", NULL, NULL, (LPBYTE)dn, &dnSize);
                     std::string displayName(dn);
-                    for (auto& av : {antivirusList}) {
-                        size_t comma = 0;
-                        while (comma != std::string::npos) {
-                            std::string single = av.substr(comma == 0 ? 0 : comma + 2);
-                            comma = av.find(",", comma == 0 ? 0 : comma + 2);
-                            if (displayName.find(single) != std::string::npos) {
-                                char uninstall[512] = ""; DWORD usSize = sizeof(uninstall);
-                                if (RegQueryValueEx(hSubkey, "UninstallString", NULL, NULL, (LPBYTE)uninstall, &usSize) == ERROR_SUCCESS) {
-                                    std::string cmd(uninstall);
-                                    cmd += " /S /quiet /norestart";
-                                    Helper::runSystemCommand(cmd.c_str());
+                    // v1.2.2 bugfix: the old split kept the WHOLE list as the first
+                    // token (comma was only advanced after substr), so with >= 2 AVs
+                    // only the last product was ever matched
+                    size_t start = 0;
+                    while (start != std::string::npos && start < antivirusList.size()) {
+                        size_t comma = antivirusList.find(", ", start);
+                        std::string single = (comma == std::string::npos)
+                            ? antivirusList.substr(start)
+                            : antivirusList.substr(start, comma - start);
+                        start = (comma == std::string::npos) ? std::string::npos : comma + 2;
+                        if (displayName.find(single) != std::string::npos) {
+                            char uninstall[512] = ""; DWORD usSize = sizeof(uninstall);
+                            if (RegQueryValueEx(hSubkey, "UninstallString", NULL, NULL, (LPBYTE)uninstall, &usSize) == ERROR_SUCCESS) {
+                                // v1.2.2: quote the executable (paths with spaces broke
+                                // the command) and pick the right silent switch:
+                                // MSI wants /qn, InstallShield/NSIS-style wants /S
+                                std::string raw(uninstall);
+                                std::string lowered = raw;
+                                std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                                bool isMsi = lowered.find("msiexec") != std::string::npos;
+                                std::string cmd;
+                                if (!raw.empty() && raw[0] != '"') {
+                                    // quote up to and including .exe/.msi if unquoted
+                                    // (NOMINMAX: avoid std::min, the Windows.h macro wins)
+                                    size_t exePos = lowered.find(".exe");
+                                    size_t msiPos = lowered.find(".msi");
+                                    size_t endPos = std::string::npos;
+                                    if (exePos != std::string::npos) endPos = exePos;
+                                    if (msiPos != std::string::npos &&
+                                        (endPos == std::string::npos || msiPos < endPos)) endPos = msiPos;
+                                    if (endPos != std::string::npos) {
+                                        endPos += 4; // include the extension
+                                        std::string exePart = raw.substr(0, endPos);
+                                        std::string rest = raw.substr(endPos);
+                                        if (exePart.find(' ') != std::string::npos) {
+                                            cmd = "\"" + exePart + "\"" + rest;
+                                        }
+                                        else cmd = raw;
+                                    }
+                                    else cmd = raw;
+                                }
+                                else cmd = raw;
+                                cmd += isMsi ? " /qn /norestart" : " /S /quiet /norestart";
+                                // v1.2.2: check the exit code - "attempted" must not
+                                // count as success when the uninstaller failed
+                                int rc = Helper::runSystemCommandExitCode(cmd.c_str());
+                                if (rc == 0 || rc == 3010) { // 3010 = success, reboot pending
                                     anyRemoved = true;
                                 }
-                                break;
+                                else {
+                                    anyFailed = true;
+                                    Helper::printConcern("- Uninstall of " + single +
+                                        " returned exit code " + std::to_string(rc));
+                                }
                             }
+                            break;
                         }
                     }
                     RegCloseKey(hSubkey);
@@ -1916,6 +2297,9 @@ void Checks::check3rdPartyAntiVirus()
             Helper::logAppliedChange("info:3rd party AV uninstall was attempted (" + antivirusList +
                 ") - reinstall it manually if it is still needed");
             Helper::recordResult("3rd Party AV", "OK", "Uninstall attempted: " + antivirusList);
+        } else if (anyFailed) {
+            Helper::printError("- Uninstall of 3rd party AV failed (" + antivirusList + ")");
+            Helper::recordResult("3rd Party AV", "FAIL", "Uninstall failed: " + antivirusList);
         } else {
             Helper::printError("- 3rd party Anti-Virus detected: " + antivirusList);
             Helper::recordResult("3rd Party AV", "FAIL", "Found: " + antivirusList);
@@ -1948,9 +2332,10 @@ void Checks::uninstallRiotVanguard()
         result = RegOpenKeyEx(hKey, subkeyName, 0, KEY_READ, &hSubkey);
         if (result != ERROR_SUCCESS) { RegCloseKey(hKey); Helper::recordResult("Riot Vanguard", "FAIL", "RegEnum failed"); return; }
 
-        char displayName[256];
+        char displayName[256] = {};
         DWORD displayNameSize = sizeof(displayName);
         result = RegQueryValueEx(hSubkey, "DisplayName", NULL, NULL, (LPBYTE)displayName, &displayNameSize);
+        displayName[sizeof(displayName) - 1] = '\0'; // v1.2.2: force termination
         if (result == ERROR_SUCCESS && strcmp(displayName, "Riot Vanguard") == 0) {
             RegCloseKey(hSubkey);
             RegCloseKey(hKey);
@@ -1970,7 +2355,14 @@ void Checks::uninstallRiotVanguard()
                 const char* vgPath = std::filesystem::exists("C:\\Program Files\\Riot Vanguard\\installer.exe")
                     ? "C:\\Program Files\\Riot Vanguard\\installer.exe"
                     : "C:\\Program Files (x86)\\Riot Vanguard\\installer.exe";
-                _spawnl(_P_WAIT, vgPath, "installer.exe", NULL);
+                // v1.2.2 bugfix: _P_WAIT blocked headless runs forever on the
+                // interactive uninstall dialog - detach in headless mode
+                if (Helper::cliConfig.headless) {
+                    _spawnl(_P_DETACH, vgPath, "installer.exe", NULL);
+                }
+                else {
+                    _spawnl(_P_WAIT, vgPath, "installer.exe", NULL);
+                }
                 Helper::logAppliedChange("info:Riot Vanguard uninstall was started - reinstall it manually if it is still needed");
                 Helper::printError("- Riot Vanguard needs to be uninstalled");
                 Helper::recordResult("Riot Vanguard", "FAIL", "Installed - prompted uninstall");
@@ -1989,15 +2381,65 @@ void Checks::uninstallRiotVanguard()
     Helper::recordResult("Riot Vanguard", "OK", "Not installed");
 }
 
+namespace {
+    // v1.2.2: true when the VC runtime DLL exists in the given directory.
+    // A 32-bit build must disable WOW64 file system redirection, otherwise
+    // "System32" resolves to SysWOW64 and the x64 DLLs can never be seen.
+    bool vcDllPresent(const char* dir, const char* name)
+    {
+        std::string path = std::string(dir) + name;
+#if !defined(_WIN64)
+        PVOID oldRedir = NULL;
+        BOOL disabled = Wow64DisableWow64FsRedirection(&oldRedir);
+        bool found = std::filesystem::exists(path);
+        if (disabled) Wow64RevertWow64FsRedirection(oldRedir);
+        return found;
+#else
+        return std::filesystem::exists(path);
+#endif
+    }
+
+    // v1.2.2 bugfix: the old check ORed the architectures per DLL, so a
+    // half-installed runtime (e.g. only the x64 DLLs) reported "already
+    // installed" while x86 games still failed. Both architectures are now
+    // required on 64-bit Windows; 32-bit Windows only has System32.
+    bool vcRedistInstalled()
+    {
+        const bool is64bitOs = std::filesystem::exists("C:\\Windows\\SysWOW64");
+        const bool system32 = vcDllPresent("C:\\Windows\\System32\\", "vcruntime140.dll") &&
+                              vcDllPresent("C:\\Windows\\System32\\", "msvcp140.dll");
+        if (!is64bitOs) return system32;
+        const bool sysWow64 = vcDllPresent("C:\\Windows\\SysWOW64\\", "vcruntime140.dll") &&
+                              vcDllPresent("C:\\Windows\\SysWOW64\\", "msvcp140.dll");
+        return system32 && sysWow64;
+    }
+
+    // v1.2.2: at most one install run at a time - a detached phase-1 thread
+    // and the phase-2 re-run would otherwise download/install to the same
+    // target files (C:\Windows\VC_redist.*.exe) concurrently
+    std::atomic<bool> g_vcInstallRunning{ false };
+}
+
 void Checks::installVCRedist()
 {
     SetConsoleTitleA("Downloading VCRedist");
+
+    if (g_vcInstallRunning.exchange(true)) {
+        // another run is already working on it - wait for its result (bounded)
+        for (int i = 0; i < 600 && !Helper::vcComplete; ++i) Sleep(100);
+        if (Helper::vcComplete) return;   // the other run finished the job
+        Helper::printConcern("- VCRedist install is already running elsewhere");
+        Helper::recordResult("VC Redist", "WARN", "Concurrent install run still active");
+        return;
+    }
+    struct VcRunningGuard {
+        ~VcRunningGuard() { g_vcInstallRunning = false; }
+    } vcGuard;
+
     Helper::vcComplete = false;
 
-    bool alreadyInstalled = (std::filesystem::exists("C:\\Windows\\System32\\vcruntime140.dll") ||
-                             std::filesystem::exists("C:\\Windows\\SysWOW64\\vcruntime140.dll")) &&
-                            (std::filesystem::exists("C:\\Windows\\System32\\msvcp140.dll") ||
-                             std::filesystem::exists("C:\\Windows\\SysWOW64\\msvcp140.dll"));
+    // v1.2.2: both architectures per DLL (see vcRedistInstalled)
+    bool alreadyInstalled = vcRedistInstalled();
     if (alreadyInstalled) {
         Helper::printSuccess("- VCRedist is already installed", false);
         Helper::recordResult("VC Redist", "OK", "Already installed");
@@ -2041,10 +2483,7 @@ void Checks::installVCRedist()
     Helper::runSystemCommand("C:\\Windows\\VC_redist.x86.exe /install /q /norestart");
     Helper::logAppliedChange("info:Microsoft Visual C++ Redistributable was installed - uninstall it via Apps & Features if unwanted");
 
-    if (!(std::filesystem::exists("C:\\Windows\\System32\\vcruntime140.dll") ||
-          std::filesystem::exists("C:\\Windows\\SysWOW64\\vcruntime140.dll")) ||
-        !(std::filesystem::exists("C:\\Windows\\System32\\msvcp140.dll") ||
-          std::filesystem::exists("C:\\Windows\\SysWOW64\\msvcp140.dll"))) {
+    if (!vcRedistInstalled()) {
         Helper::printError("- VCRedist didn't install correctly (Error 11)");
         Helper::recordResult("VC Redist", "FAIL", "Install verify failed");
         Sleep(1000);
@@ -2141,34 +2580,31 @@ void Checks::isChromeInstalled()
 
 void Checks::syncWindowsTime()
 {
-    SetConsoleTitleA("Syncing Windows Time");
+    SetConsoleTitleA("Checking Windows Time Sync");
 
-    // First check if time service is already running
+    // v1.2.2: the old code requested "Repair and start Windows Time service"
+    // whenever the service was not RUNNING at that moment - on machines with the
+    // default manual/trigger start that produced a pending change on EVERY run.
+    // Decide by START TYPE (registry, language-independent):
+    //   disabled -> repair needs approval; manual/auto but stopped -> just start it.
     ServiceStatus currentStatus = Helper::getServiceStatus("W32Time");
-    if (currentStatus == STATUS_SERVICE_RUNNING) {
-        // Already running - just resync
-        Helper::runSystemCommand("w32tm /resync");
-        Helper::printSuccess("- Windows Time is running", false);
-        Helper::recordResult("Time Sync", "OK", "Running, resynced");
-        return;
-    }
-
-    SC_HANDLE scmHandle = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
-    if (scmHandle == NULL) {
-        DWORD err = GetLastError();
-        Helper::printError("- Failed to sync Windows Time (Error 14, GLE=" + std::to_string(err) + ")");
-        Helper::recordResult("Time Sync", "FAIL", "SCM open failed");
-        return;
-    }
-    if (!Helper::requestChange("Repair and start Windows Time service")) {
-        CloseServiceHandle(scmHandle);
-        Helper::recordResult("Time Sync", "WARN", "Disabled - repair pending approval");
-        return;
-    }
-
-    Helper::runSystemCommand("w32tm /register");
-
-    if (Helper::getServiceStatus("W32Time") == STATUS_SERVICE_STOPPED) {
+    DWORD startType = 3;
+    bool startKnown = Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE,
+        "SYSTEM\\CurrentControlSet\\Services\\W32Time", "Start", &startType);
+    if (startKnown && startType == 4) {
+        // genuinely disabled - re-enable needs approval (Undo reverts the marker)
+        SC_HANDLE scmHandle = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+        if (scmHandle == NULL) {
+            DWORD err = GetLastError();
+            Helper::printError("- Failed to sync Windows Time (Error 14, GLE=" + std::to_string(err) + ")");
+            Helper::recordResult("Time Sync", "FAIL", "SCM open failed");
+            return;
+        }
+        if (!Helper::requestChange("Enable and start Windows Time service")) {
+            CloseServiceHandle(scmHandle);
+            Helper::recordResult("Time Sync", "WARN", "Disabled - enable pending approval");
+            return;
+        }
         SC_HANDLE serviceHandle = OpenService(scmHandle, "W32Time", SERVICE_ALL_ACCESS);
         if (serviceHandle == NULL) {
             Helper::printError("- Failed to sync Windows Time (Error 15)");
@@ -2176,57 +2612,77 @@ void Checks::syncWindowsTime()
             CloseServiceHandle(scmHandle);
             return;
         }
-        DWORD bytesNeeded = 0;
-        QueryServiceConfig(serviceHandle, NULL, 0, &bytesNeeded);
-        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || bytesNeeded == 0) {
-            Helper::printError("- Failed to sync Windows Time (Error 16)");
-            Helper::recordResult("Time Sync", "FAIL", "Config query failed");
-            CloseServiceHandle(serviceHandle); CloseServiceHandle(scmHandle);
-            return;
-        }
-        std::vector<BYTE> buffer(bytesNeeded);
-        LPQUERY_SERVICE_CONFIG serviceConfig = (LPQUERY_SERVICE_CONFIG)buffer.data();
-        if (!QueryServiceConfig(serviceHandle, serviceConfig, bytesNeeded, &bytesNeeded)) {
-            Helper::printError("- Failed to sync Windows Time (Error 16)");
-            CloseServiceHandle(serviceHandle); CloseServiceHandle(scmHandle);
-            return;
-        }
-        if (serviceConfig->dwStartType == SERVICE_DISABLED) {
-            Helper::printError("- Failed to sync Windows Time (Error 17)");
-            CloseServiceHandle(serviceHandle); CloseServiceHandle(scmHandle);
-            return;
-        }
-        if (!ChangeServiceConfig(serviceHandle, SERVICE_NO_CHANGE, SERVICE_AUTO_START, SERVICE_NO_CHANGE, NULL, NULL, NULL, NULL, NULL, NULL, NULL)) {
+        if (!ChangeServiceConfig(serviceHandle, SERVICE_NO_CHANGE, SERVICE_AUTO_START, SERVICE_NO_CHANGE,
+            NULL, NULL, NULL, NULL, NULL, NULL, NULL)) {
             Helper::printError("- Failed to sync Windows Time (Error 18)");
+            Helper::recordResult("Time Sync", "FAIL", "Start type change failed");
             CloseServiceHandle(serviceHandle); CloseServiceHandle(scmHandle);
             return;
         }
-        // only when the start type really changed: Undo-CL-Setup.ps1 sets it back to demand
-        if (serviceConfig->dwStartType != SERVICE_AUTO_START) {
-            Helper::logAppliedChange("service:W32Time=auto");
-        }
-        if (StartService(serviceHandle, 0, NULL) == FALSE) {
+        // v1.2.2 bugfix: carry the ORIGINAL start type - Undo used to force
+        // "demand" even when the start type was 4 (disabled) before this run
+        Helper::logAppliedChange("service:W32Time=was" + std::to_string(startType));
+        if (currentStatus == STATUS_SERVICE_STOPPED &&
+            StartService(serviceHandle, 0, NULL) == FALSE && GetLastError() != ERROR_SERVICE_ALREADY_RUNNING) {
             Helper::printError("- Failed to sync Windows Time (Error 19)");
+            Helper::recordResult("Time Sync", "FAIL", "StartService failed");
             CloseServiceHandle(serviceHandle); CloseServiceHandle(scmHandle);
             return;
         }
         CloseServiceHandle(serviceHandle);
         CloseServiceHandle(scmHandle);
         Sleep(250);
+        int rc = Helper::runSystemCommandExitCode("w32tm /resync");
+        Helper::printSuccess(rc == 0 ? "- Windows Time enabled and synced" :
+            "- Windows Time service enabled (resync will retry automatically)", true);
+        Helper::recordResult("Time Sync", rc == 0 ? "OK" : "WARN",
+            rc == 0 ? "Enabled + synced (changed)" : "Enabled, resync failed (changed)");
+        return;
     }
-    else { CloseServiceHandle(scmHandle); }
 
-    Helper::runSystemCommand("w32tm /resync");
-    Helper::printSuccess("- Successfully synced Windows time", true);
-    Helper::recordResult("Time Sync", "OK", "Synced (was disabled)");
+    // start type manual/auto (Windows default is manual): if the service happens
+    // to be stopped, start it WITHOUT asking - it is not a configuration change
+    if (currentStatus != STATUS_SERVICE_RUNNING) {
+        SC_HANDLE scmHandle = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
+        if (scmHandle != NULL) {
+            SC_HANDLE serviceHandle = OpenService(scmHandle, "W32Time", SERVICE_START | SERVICE_QUERY_STATUS);
+            if (serviceHandle != NULL) {
+                StartService(serviceHandle, 0, NULL);
+                CloseServiceHandle(serviceHandle);
+            }
+            CloseServiceHandle(scmHandle);
+            Sleep(250);
+        }
+    }
+
+    int rc = Helper::runSystemCommandExitCode("w32tm /resync");
+    if (rc == 0) {
+        Helper::printSuccess("- Windows Time is synced", false);
+        Helper::recordResult("Time Sync", "OK", "Synced");
+    }
+    else {
+        // service running but NTP unreachable: not a config problem - report, no pending
+        Helper::printConcern("- Time service running but resync failed (exit " +
+            std::to_string(rc) + ") - check internet/firewall");
+        Helper::recordResult("Time Sync", "WARN", "Resync failed (exit " + std::to_string(rc) + ")");
+    }
 }
 
 void Checks::disableChromeProtection()
 {
     SetConsoleTitleA("Disabling Google Chrome Protection");
 
+    // v1.2.2: Chrome's default install is per-user in %LOCALAPPDATA% - checking
+    // only Program Files reported "Chrome not installed" on typical systems
     bool chromeInstalled = std::filesystem::exists(L"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe") ||
                            std::filesystem::exists(L"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe");
+    if (!chromeInstalled) {
+        wchar_t localAppData[MAX_PATH] = {};
+        if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH) > 0) {
+            chromeInstalled = std::filesystem::exists(
+                std::wstring(localAppData) + L"\\Google\\Chrome\\Application\\chrome.exe");
+        }
+    }
     if (!chromeInstalled) {
         Helper::recordResult("Chrome Protection", "SKIPPED", "Chrome not installed");
         return;
@@ -2237,7 +2693,10 @@ void Checks::disableChromeProtection()
     DWORD status;
     if (Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE, "SOFTWARE\\Policies\\Google\\Chrome",
         "SafeBrowsingProtectionLevel", &status)) {
-        if (status == 0x00000001) {
+        // v1.2.2 bugfix: 0 = NoProtection (off), 1 = Standard Protection (ON!) -
+        // the check used to treat 1 as "already disabled" and wrote 1, so Safe
+        // Browsing stayed enabled while the tool reported success
+        if (status == 0x00000000) {
             Helper::printSuccess("- Chrome protection is already disabled", false);
             Helper::recordResult("Chrome Protection", "OK", "Already disabled");
             return;
@@ -2249,11 +2708,14 @@ void Checks::disableChromeProtection()
         return;
     }
 
-    HKEY hKey; DWORD disp; DWORD value = 0x00000001;
+    HKEY hKey = NULL; DWORD disp; DWORD value = 0x00000000; // v1.2.2: 0 = NoProtection (Chrome policy)
     LONG createKey = RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SOFTWARE\\Policies\\Google\\Chrome",
         0, NULL, REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hKey, &disp);
-    LONG createDWORD = RegSetValueEx(hKey, "SafeBrowsingProtectionLevel", NULL, REG_DWORD, (const BYTE*)&value, sizeof(value));
-    RegCloseKey(hKey);
+    // v1.2.2 bugfix: policy value was 1 (= Standard Protection, i.e. STILL ON)
+    LONG createDWORD = (createKey == ERROR_SUCCESS)
+        ? RegSetValueEx(hKey, "SafeBrowsingProtectionLevel", NULL, REG_DWORD, (const BYTE*)&value, sizeof(value))
+        : createKey;
+    if (createKey == ERROR_SUCCESS) RegCloseKey(hKey);
     Helper::logAppliedChange("reg:SOFTWARE\\Policies\\Google\\Chrome");
 
     if (createKey == ERROR_SUCCESS && createDWORD == ERROR_SUCCESS) {
@@ -2275,15 +2737,30 @@ void Checks::checkWinver()
         Helper::recordResult("Winver", "FAIL", "Registry open failed");
         return;
     }
-    char buildStr[32]; DWORD buildSize = sizeof(buildStr);
+    char buildStr[32] = {}; DWORD buildSize = sizeof(buildStr);
     LONG ret = RegQueryValueEx(hKey, "CurrentBuild", NULL, NULL, (LPBYTE)buildStr, &buildSize);
     RegCloseKey(hKey);
+    buildStr[sizeof(buildStr) - 1] = '\0'; // v1.2.2: guarantee termination
     if (ret != ERROR_SUCCESS) {
         Helper::printError("- Failed to check Winver (Error 22)");
         Helper::recordResult("Winver", "FAIL", "Read failed");
         return;
     }
-    int build = std::stoi(buildStr);
+    // v1.2.2: validate before conversion - an unexpected registry value must not
+    // throw std::out_of_range and wipe the whole run via an uncaught exception
+    int build = 0;
+    {
+        bool digitsOnly = buildStr[0] != '\0';
+        for (const char* p = buildStr; *p; ++p) {
+            if (*p < '0' || *p > '9') { digitsOnly = false; break; }
+        }
+        if (!digitsOnly) {
+            Helper::printError("- Failed to check Winver (unexpected CurrentBuild value)");
+            Helper::recordResult("Winver", "FAIL", "Invalid CurrentBuild value");
+            return;
+        }
+        build = std::atoi(buildStr);
+    }
 
     char productName[128] = ""; DWORD productSize = sizeof(productName);
     if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
@@ -2335,9 +2812,15 @@ void Checks::deleteSymbols()
         }
 
         std::error_code ec;
-        if (!std::filesystem::remove_all(path, ec)) {
-            Helper::printError("- Unable to delete " + path + " (Error 24, " + ec.message() + ")");
-            Helper::recordResult("Symbols", "FAIL", "Delete failed: " + ec.message());
+        std::filesystem::remove_all(path, ec);
+        // v1.2.2: remove_all returns the number of REMOVED entries - a partial
+        // delete (files gone, root locked) still returned > 0 and was reported
+        // as success. Verify the directory is actually gone.
+        std::error_code existsEc;
+        if (std::filesystem::exists(path, existsEc)) {
+            std::string detail = ec ? ec.message() : "still present after delete";
+            Helper::printError("- Unable to delete " + path + " (Error 24, " + detail + ")");
+            Helper::recordResult("Symbols", "FAIL", "Delete failed: " + detail);
             return;
         }
         Helper::printSuccess("- Successfully deleted " + path, true);
@@ -2368,11 +2851,14 @@ void Checks::checkFastBoot()
         return;
     }
 
-    HKEY hKey; DWORD disp; DWORD value = 0;
+    HKEY hKey = NULL; DWORD disp; DWORD value = 0;
     LONG ck = RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power",
         0, NULL, REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hKey, &disp);
-    LONG cd = RegSetValueEx(hKey, "HiberbootEnabled", NULL, REG_DWORD, (const BYTE*)&value, sizeof(value));
-    RegCloseKey(hKey);
+    // v1.2.2: never touch/close an uninitialized handle when Create failed
+    LONG cd = (ck == ERROR_SUCCESS)
+        ? RegSetValueEx(hKey, "HiberbootEnabled", NULL, REG_DWORD, (const BYTE*)&value, sizeof(value))
+        : ck;
+    if (ck == ERROR_SUCCESS) RegCloseKey(hKey);
     Helper::logAppliedChange("reg:SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power");
     if (ck == ERROR_SUCCESS && cd == ERROR_SUCCESS) {
         Helper::printSuccess("- Successfully disabled Fast-Boot", true);
@@ -2394,31 +2880,36 @@ void Checks::checkExploitProtection()
     if (Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE,
         "SOFTWARE\\Policies\\Microsoft\\Windows Defender Security Center\\App and Browser protection",
         "DisallowExploitProtectionOverride", &status)) {
+        // v1.2.2 bugfix: this policy only LOCKS the UI (users may not change the
+        // settings) - it does NOT disable the protections themselves. The old
+        // "is disabled" wording claimed the opposite of what the value does.
         if (status == 1) {
-            Helper::printSuccess("- Exploit-Protection is disabled", false);
-            Helper::recordResult("Exploit Protection", "OK", "Already disabled");
+            Helper::printSuccess("- Exploit-Protection changes are locked by policy (protections stay active)", false);
+            Helper::recordResult("Exploit Protection", "OK", "Override locked by policy");
             return;
         }
     }
-    if (!Helper::requestChange("Disable Exploit Protection override")) {
-        Helper::recordResult("Exploit Protection", "WARN", "Enabled - disable pending approval");
+    if (!Helper::requestChange("Lock Exploit-Protection settings (DisallowExploitProtectionOverride)")) {
+        Helper::recordResult("Exploit Protection", "WARN", "Not locked - lock pending approval");
         return;
     }
 
-    HKEY hKey; DWORD disp; DWORD value = 1;
+    HKEY hKey = NULL; DWORD disp; DWORD value = 1;
     LONG ck = RegCreateKeyEx(HKEY_LOCAL_MACHINE,
         "SOFTWARE\\Policies\\Microsoft\\Windows Defender Security Center\\App and Browser protection",
         0, NULL, REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hKey, &disp);
-    LONG cd = RegSetValueEx(hKey, "DisallowExploitProtectionOverride", NULL, REG_DWORD, (const BYTE*)&value, sizeof(value));
-    RegCloseKey(hKey);
+    LONG cd = (ck == ERROR_SUCCESS)
+        ? RegSetValueEx(hKey, "DisallowExploitProtectionOverride", NULL, REG_DWORD, (const BYTE*)&value, sizeof(value))
+        : ck;
+    if (ck == ERROR_SUCCESS) RegCloseKey(hKey);
     Helper::logAppliedChange("reg:SOFTWARE\\Policies\\Microsoft\\Windows Defender Security Center\\App and Browser protection");
     if (ck == ERROR_SUCCESS && cd == ERROR_SUCCESS) {
-        Helper::printSuccess("- Successfully disabled Exploit-Protection", true);
+        Helper::printSuccess("- Locked Exploit-Protection settings by policy (protections stay active)", true);
         Helper::restartRequired = true;
-        Helper::recordResult("Exploit Protection", "OK", "Disabled (changed)");
+        Helper::recordResult("Exploit Protection", "OK", "Override locked (changed)");
     }
     else {
-        Helper::printError("- Failed to disable Exploit-Protection (Error 25/26)");
+        Helper::printError("- Failed to lock Exploit-Protection settings (Error 25/26)");
         Helper::recordResult("Exploit Protection", "FAIL", "Registry write failed");
     }
 }
@@ -2441,11 +2932,13 @@ void Checks::checkSmartScreen()
         return;
     }
 
-    HKEY hKey; DWORD disp; DWORD value = 0;
+    HKEY hKey = NULL; DWORD disp; DWORD value = 0;
     LONG ck = RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SOFTWARE\\Policies\\Microsoft\\Windows\\System",
         0, NULL, REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hKey, &disp);
-    LONG cd = RegSetValueEx(hKey, "EnableSmartScreen", NULL, REG_DWORD, (const BYTE*)&value, sizeof(value));
-    RegCloseKey(hKey);
+    LONG cd = (ck == ERROR_SUCCESS)
+        ? RegSetValueEx(hKey, "EnableSmartScreen", NULL, REG_DWORD, (const BYTE*)&value, sizeof(value))
+        : ck;
+    if (ck == ERROR_SUCCESS) RegCloseKey(hKey);
     Helper::logAppliedChange("reg:SOFTWARE\\Policies\\Microsoft\\Windows\\System");
     if (ck == ERROR_SUCCESS && cd == ERROR_SUCCESS) {
         Helper::printSuccess("- Successfully disabled SmartScreen", true);
@@ -2462,25 +2955,29 @@ void Checks::checkGameBar()
 {
     SetConsoleTitleA("Checking Xbox Gamebar");
     Helper::backupRegistryKey(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\GameDVR");
-    DWORD status;
-    if (Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE,
-        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\GameDVR", "AppCaptureEnabled", &status)) {
-        if (status == 1) {
-            Helper::printSuccess("- Gamebar is enabled", false);
-            Helper::recordResult("Game Bar", "OK", "Already enabled");
-            return;
-        }
+    // v1.2.2: a missing value is the Windows default (Game Bar capture is ON out
+    // of the box) - only an explicit 0 means "disabled, enable pending", the old
+    // code raised a pending change on every Windows 11 default install
+    DWORD status = 1;
+    Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE,
+        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\GameDVR", "AppCaptureEnabled", &status);
+    if (status == 1) {
+        Helper::printSuccess("- Gamebar is enabled", false);
+        Helper::recordResult("Game Bar", "OK", "Already enabled");
+        return;
     }
     if (!Helper::requestChange("Enable Xbox Game Bar capture setting")) {
         Helper::recordResult("Game Bar", "WARN", "Disabled - enable pending approval");
         return;
     }
 
-    HKEY hKey; DWORD disp; DWORD value = 1;
+    HKEY hKey = NULL; DWORD disp; DWORD value = 1;
     LONG ck = RegCreateKeyEx(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\GameDVR",
         0, NULL, REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hKey, &disp);
-    LONG cd = RegSetValueEx(hKey, "AppCaptureEnabled", NULL, REG_DWORD, (const BYTE*)&value, sizeof(value));
-    RegCloseKey(hKey);
+    LONG cd = (ck == ERROR_SUCCESS)
+        ? RegSetValueEx(hKey, "AppCaptureEnabled", NULL, REG_DWORD, (const BYTE*)&value, sizeof(value))
+        : ck;
+    if (ck == ERROR_SUCCESS) RegCloseKey(hKey);
     Helper::logAppliedChange("reg:SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\GameDVR");
     if (ck == ERROR_SUCCESS && cd == ERROR_SUCCESS) {
         Helper::printSuccess("- Successfully enabled Gamebar", true);
@@ -2503,7 +3000,14 @@ void Checks::checkModifiedOS()
         SC_HANDLE scm = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
         if (scm) {
             SC_HANDLE svc = OpenService(scm, name, SERVICE_QUERY_STATUS);
-            if (svc == NULL) { modified = true; reasons += std::string(" ") + label + " missing;"; }
+            if (svc == NULL) {
+                // v1.2.2 bugfix: only a genuinely MISSING service indicates a
+                // modified OS - access denied / transient SCM errors must not
+                // flag the system as modified
+                if (GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST) {
+                    modified = true; reasons += std::string(" ") + label + " missing;";
+                }
+            }
             else CloseServiceHandle(svc);
             CloseServiceHandle(scm);
         }
@@ -2604,17 +3108,36 @@ void Checks::checkTPMStatus()
     }
 
     // No registry state: ask the TPM WMI provider (same source as tpm.msc / Get-Tpm)
+    // v1.2.2: the query emits explicit sentinels so three cases can be told
+    // apart: real data ("spec|enabled|activated"), NOTPM (Windows reports no
+    // TPM instance - the normal answer on machines without a TPM / with it
+    // disabled in BIOS = OK) and TPMERR (the query itself failed: access
+    // denied, WMI blocked, PowerShell missing). The old code saw an empty
+    // string for both NOTPM and TPMERR and warned on every TPM-less machine.
     std::string tpmCommand =
         "powershell -NoProfile -NonInteractive -Command \""
-        "(Get-CimInstance -Namespace root/cimv2/security/microsofttpm -ClassName Win32_Tpm | "
-        "ForEach-Object { $_.SpecVersion + '|' + $_.IsEnabled_InitialValue + '|' + $_.IsActivated_InitialValue })\" 2>nul";
+        "try { $t = Get-CimInstance -Namespace root/cimv2/security/microsofttpm -ClassName Win32_Tpm -ErrorAction Stop | Select-Object -First 1; "
+        "if ($t) { $t.SpecVersion + '|' + $t.IsEnabled_InitialValue + '|' + $t.IsActivated_InitialValue } else { 'NOTPM' } } "
+        "catch { 'TPMERR' }\" 2>nul";
     std::string output = trimCopy(Helper::runSystemCommandWithOutput(tpmCommand.c_str(), 20000));
     if (output == "TIMEOUT") output.clear();
 
-    size_t firstSep = output.find('|');
-    if (firstSep == std::string::npos) {
+    if (output.find("NOTPM") != std::string::npos) {
         Helper::printSuccess("- TPM is disabled / not usable (no TPM reported by Windows)", false);
         Helper::recordResult("TPM", "OK", "Disabled/not usable");
+        return;
+    }
+    if (output.find("TPMERR") != std::string::npos || output.empty()) {
+        Helper::printConcern("- Could not determine TPM state (query failed)");
+        Helper::recordResult("TPM", "WARN", "State unknown (query failed)");
+        return;
+    }
+
+    size_t firstSep = output.find('|');
+    if (firstSep == std::string::npos) {
+        // non-empty but not a sentinel and no separator: PowerShell noise
+        Helper::printConcern("- Could not determine TPM state (unexpected query output)");
+        Helper::recordResult("TPM", "WARN", "State unknown (unexpected output)");
         return;
     }
 
@@ -2798,13 +3321,21 @@ void Checks::checkDMAProtection()
     std::string available = trimCopy(Helper::runSystemCommandWithOutput(deviceGuardCommand.c_str(), 20000));
     if (available == "TIMEOUT") available.clear();
 
-    if (!available.empty() && csvContains(available, 3)) {
-        Helper::printSuccess("- Kernel DMA Protection is supported by the firmware, currently off", false);
-        Helper::recordResult("DMA Protection", "OK", "Supported, not active (msinfo32: Off)");
+    // v1.2.2 bugfix: AvailableSecurityProperties=3 means DMA protection is
+    // SUPPORTED by the firmware, not that it is off (msinfo32 shows On/Off and
+    // supporting systems enable it automatically) - claiming "currently off"
+    // here could never fail. Without a readable state the answer is unknown.
+    if (available.empty()) {
+        Helper::printConcern("- Could not determine Kernel DMA Protection state (WMI query failed)");
+        Helper::recordResult("DMA Protection", "WARN", "State unknown (WMI query failed)");
+    }
+    else if (csvContains(available, 3)) {
+        Helper::printConcern("- Kernel DMA Protection is supported by firmware - verify state in msinfo32");
+        Helper::recordResult("DMA Protection", "WARN", "Supported by firmware, state unknown");
     }
     else {
-        Helper::printSuccess("- Kernel DMA Protection is not active", false);
-        Helper::recordResult("DMA Protection", "OK", "Not active/not supported");
+        Helper::printSuccess("- Kernel DMA Protection is not supported / not active", false);
+        Helper::recordResult("DMA Protection", "OK", "Not supported");
     }
 }
 
@@ -2815,13 +3346,25 @@ void Checks::checkUAC()
     if (Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE,
         "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
         "EnableLUA", &uacEnabled)) {
+        // v1.2.2: the slider at "Never notify" keeps EnableLUA=1 and only sets
+        // ConsentPromptBehaviorAdmin=0 - checking EnableLUA alone reported
+        // "UAC is enabled" on machines where the user already turned it off
+        DWORD consent = 5;
+        Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE,
+            "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+            "ConsentPromptBehaviorAdmin", &consent);
+
         if (uacEnabled == 0) {
-            Helper::printSuccess("- UAC notifications are disabled", false);
+            // v1.2.2: OK states stay off the console - only actionable findings print
             Helper::recordResult("UAC", "OK", "Disabled");
         }
+        else if (consent == 0) {
+            Helper::recordResult("UAC", "OK", "Never notify (slider off)");
+        }
         else {
-            Helper::printConcern("- UAC is enabled, consider disabling UAC");
-            Helper::recordResult("UAC", "WARN", "Enabled - consider disabling");
+            // v1.2.2: no console line either - log/JSON only (status INFO is
+            // not counted as warning in the summary)
+            Helper::recordResult("UAC", "INFO", "Enabled - consider disabling");
         }
     }
     else {
@@ -2834,42 +3377,31 @@ void Checks::checkWindowsUpdate()
 {
     SetConsoleTitleA("Checking Windows Update Service");
 
-    SC_HANDLE scm = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
-    if (scm == NULL) {
-        Helper::printConcern("- Could not check Windows Update service status");
-        Helper::recordResult("Windows Update", "WARN", "SCM open failed");
+    // v1.2.2: judge by the START TYPE (registry, language-independent), not by
+    // "is the service running right now". A running service with the default
+    // manual/trigger start is normal Windows behaviour and used to raise a
+    // warning on every machine ("why does it suddenly mention Windows Update").
+    DWORD startType = 3; // SERVICE_AUTO_START / SERVICE_DELAYED_AUTO_START / SERVICE_DISABLED
+    if (!Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE,
+        "SYSTEM\\CurrentControlSet\\Services\\wuauserv", "Start", &startType)) {
+        // log/JSON only - no console noise
+        Helper::recordResult("Windows Update", "SKIPPED", "Start type unreadable");
         return;
     }
 
-    SC_HANDLE service = OpenService(scm, "wuauserv", SERVICE_QUERY_STATUS);
-    if (service == NULL) {
-        Helper::printConcern("- Windows Update service not found");
-        Helper::recordResult("Windows Update", "WARN", "Service not found");
-        CloseServiceHandle(scm);
-        return;
+    // 2 = auto, 3 = demand (Windows default), 4 = disabled, 0/1 = boot/system (never used here)
+    if (startType == 4) {
+        // v1.2.2: OK states stay off the console - only actionable findings print
+        Helper::recordResult("Windows Update", "OK", "Disabled");
     }
-
-    SERVICE_STATUS_PROCESS status;
-    DWORD bytesNeeded;
-    if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, (LPBYTE)&status, sizeof(status), &bytesNeeded)) {
-        Helper::printConcern("- Could not query Windows Update service status");
-        Helper::recordResult("Windows Update", "WARN", "Query failed");
-        CloseServiceHandle(service);
-        CloseServiceHandle(scm);
-        return;
-    }
-
-    if (status.dwCurrentState == SERVICE_RUNNING) {
-        Helper::printConcern("- Windows Update service is running (recommend disabling after installing updates)");
-        Helper::recordResult("Windows Update", "WARN", "Running - recommend disabling");
+    else if (startType == 2 || startType == 1 || startType == 0) {
+        // v1.2.2: no console line either - log/JSON only (status INFO is
+        // not counted as warning in the summary)
+        Helper::recordResult("Windows Update", "INFO", "Start type: automatic");
     }
     else {
-        Helper::printSuccess("- Windows Update is disabled", false);
-        Helper::recordResult("Windows Update", "OK", "Disabled/stopped");
+        Helper::recordResult("Windows Update", "OK", "Start type: manual (default)");
     }
-
-    CloseServiceHandle(service);
-    CloseServiceHandle(scm);
 }
 
 // v1.2.1: CPUID + firmware-feature based virtualization check (no WMIC dependency)
@@ -2898,10 +3430,15 @@ void Checks::checkCPUVirtualization()
 
     const bool hwVirtualization = vmx || svm;
 
-    // PF_VIRT_FIRMWARE_ENABLED (23): firmware has hardware virtualization turned on
-    const bool firmwareEnabled = IsProcessorFeaturePresent(23) != 0;
-    // PF_HYPERVISOR_PRESENT (40): a hypervisor is currently running
-    bool hypervisorPresent = IsProcessorFeaturePresent(40) != 0;
+    // v1.2.2 fix: the old code passed 23 (= PF_FASTFAIL_AVAILABLE, almost always
+    // true) and 40 (= PF_AVX2_INSTRUCTIONS_AVAILABLE) - both wrong, which made
+    // every machine report "CPU-V enabled in BIOS" even with virtualization off.
+    // PF_VIRT_FIRMWARE_ENABLED is 21 per winnt.h / Microsoft docs.
+    const bool firmwareEnabledByOs = IsProcessorFeaturePresent(21) != 0;
+    // Hypervisor running: CPUID leaf 1 ECX bit 31 (official hypervisor-present bit)
+    bool hypervisorPresent = false;
+    __cpuid(regs, 1);
+    hypervisorPresent = (regs[2] & (1u << 31)) != 0;
     if (!hypervisorPresent) {
         // Registry fallback (written by the kernel when the hypervisor boots)
         DWORD hvReg = 0;
@@ -2911,10 +3448,15 @@ void Checks::checkCPUVirtualization()
             hypervisorPresent = hvReg != 0;
         }
     }
+    // A running hypervisor cannot exist without firmware virtualization being on
+    // (Windows hides/masks the PF_VIRT_FIRMWARE_ENABLED flag once Hyper-V runs),
+    // so treat "hypervisor active" as firmware-enabled.
+    const bool firmwareEnabled = firmwareEnabledByOs || hypervisorPresent;
 
     if (!hwVirtualization) {
-        Helper::printSuccess("- CPU does not support hardware virtualization", false);
-        Helper::recordResult("CPU-V", "OK", "Not supported by CPU");
+        // CPUID virtualization bits also disappear when the BIOS switch is off
+        Helper::printSuccess("- CPU does not expose hardware virtualization (unsupported or disabled in BIOS)", false);
+        Helper::recordResult("CPU-V", "OK", "Not exposed (unsupported or disabled in BIOS)");
         return;
     }
 
@@ -2988,6 +3530,11 @@ void Checks::checkSpoofer()
         weakHits++;
         addHit(weakList, "SMBIOS UUID is empty");
     }
+    // v1.2.2: all-same-byte UUID (11111111-...) is synthetic, never OEM
+    if (id.uuidSameByte) {
+        strongHits++;
+        addHit(strongList, "SMBIOS UUID is a repeated-byte pattern (" + id.uuidText + ")");
+    }
 
     // Odd SMBIOS version (real firmware reports 2.x or 3.x)
     if (id.smbiosMajor < 2 || id.smbiosMajor > 3) {
@@ -3015,6 +3562,22 @@ void Checks::checkSpoofer()
         }
     }
 
+    // v1.2.2: firmware layer cross-check (Type 0 vs registry) - only WEAK because
+    // some OEMs format the registry copy differently from the SMBIOS string
+    const RegPair biosPairs[] = {
+        { "BIOSVendor",  &id.biosVendor },
+        { "BIOSVersion", &id.biosVersion },
+    };
+    for (const RegPair& pair : biosPairs) {
+        const std::string regValue = readRegistryStringValue(HKEY_LOCAL_MACHINE,
+            "HARDWARE\\DESCRIPTION\\System\\BIOS", pair.regName);
+        if (identityDiffers(*pair.smbiosValue, regValue)) {
+            weakHits++;
+            addHit(weakList, std::string(pair.regName) + " differs (SMBIOS=" +
+                *pair.smbiosValue + ", registry=" + regValue + ")");
+        }
+    }
+
     if (strongHits >= 2) {
         Helper::printError("- Likely HWID spoofer detected (" + std::to_string(strongHits) +
             " strong indicators): " + strongList);
@@ -3024,7 +3587,11 @@ void Checks::checkSpoofer()
         Helper::printConcern("- Suspicious identity value: " + strongList);
         Helper::recordResult("HWID Spoofer", "WARN", strongList);
     }
-    else if (weakHits >= 2) {
+    else if (weakHits >= 3) {
+        // v1.2.2 bugfix: two WEAK hits were too easy to reach on stock
+        // hardware (nil SMBIOS UUID + a model-number-like board product such
+        // as "H610M-K" already counted as 2) - require three independent
+        // weak indicators before suggesting tampering
         Helper::printConcern("- Possible identity tampering: " + weakList);
         Helper::recordResult("HWID Spoofer", "WARN", weakList);
     }
@@ -3040,10 +3607,15 @@ void Checks::checkActivation()
 {
     SetConsoleTitleA("Checking Activation Status");
 
+    // v1.2.2: filter by the fixed Windows ApplicationId GUID instead of
+    // Name -like 'Windows*' (product names are localizable); keep the name
+    // filter as a fallback for odd systems
     std::string command =
         "powershell -NoProfile -NonInteractive -Command \""
+        "$a = '55c92734-d682-4d71-983e-d6ec3f16059f'; "
         "$p = Get-CimInstance -ClassName SoftwareLicensingProduct | "
-        "Where-Object { $_.PartialProductKey -and $_.Name -like 'Windows*' } | Select-Object -First 1; "
+        "Where-Object { $_.PartialProductKey -and ($_.ApplicationId -eq $a -or $_.Name -like 'Windows*') } | "
+        "Select-Object -First 1; "
         "if ($p) { $p.LicenseStatus } else { 'NA' }\" 2>nul";
     std::string out = trimCopy(Helper::runSystemCommandWithOutput(command.c_str(), 30000));
     if (out == "TIMEOUT") out.clear();
@@ -3054,25 +3626,27 @@ void Checks::checkActivation()
         token.find_first_not_of("0123456789") == std::string::npos;
 
     if (token.empty() || token == "NA" || !numeric) {
-        Helper::printConcern("- Could not read the Windows activation status");
-        Helper::recordResult("Activation", "WARN",
+        // v1.2.2: no console warning for unreadable status - the tool never
+        // activates anything anyway, so a failed read is not actionable
+        Helper::recordResult("Activation", "SKIPPED",
             token.empty() ? "Status unreadable" :
             (token == "NA" ? "No Windows product key found" : "Unexpected PowerShell output"));
         return;
     }
 
     // SoftwareLicensingProduct.LicenseStatus
+    // v1.2.2: activated states (1/2/3) stay OFF the console - nobody needs
+    // "Windows is activated" in a support screenshot. The result is still
+    // recorded (counted as passed, written to log/JSON); only PROBLEMS
+    // (not activated, grace, watermark) print a line.
     switch (atoi(token.c_str())) {
     case 1:
-        Helper::printSuccess("- Windows is activated (licensed)", false);
         Helper::recordResult("Activation", "OK", "Activated (licensed)");
         break;
     case 2:
-        Helper::printSuccess("- Windows is activated (out-of-box grace period)", false);
         Helper::recordResult("Activation", "OK", "Activated (OOB grace)");
         break;
     case 3:
-        Helper::printSuccess("- Windows is activated (out-of-tolerance grace period)", false);
         Helper::recordResult("Activation", "OK", "Activated (OOT grace)");
         break;
     case 0:
@@ -3131,6 +3705,8 @@ void Helper::printSuccess(const std::string& message, bool changed)
 {
     if (cliConfig.quiet) return;
     std::lock_guard<std::mutex> lock(consoleMutex);
+    // v1.2.2: print each line at most once per run (apply phase re-runs checks)
+    if (!g_printedLines.insert(std::string("[+]") + message + (changed ? "!" : "")).second) return;
     Color::setForegroundColor(Color::Green);
     std::cout << "[+] ";
     Color::setForegroundColor(Color::White);
@@ -3141,8 +3717,10 @@ void Helper::printSuccess(const std::string& message, bool changed)
 
 void Helper::printConcern(const std::string& message)
 {
-    if (cliConfig.quiet) return;
+    // v1.2.2 bugfix: --quiet promised "only show errors and warnings" but this
+    // returned early like the others - quiet now shows concerns and errors
     std::lock_guard<std::mutex> lock(consoleMutex);
+    if (!g_printedLines.insert(std::string("[-]") + message).second) return;
     Color::setForegroundColor(Color::Yellow);
     std::cout << "[-] ";
     Color::setForegroundColor(Color::White);
@@ -3151,8 +3729,8 @@ void Helper::printConcern(const std::string& message)
 
 void Helper::printError(const std::string& message)
 {
-    if (cliConfig.quiet) return;
-    std::lock_guard<std::mutex> lock(consoleMutex);
+    std::lock_guard<std::mutex> lock(consoleMutex); // v1.2.2: visible in --quiet too
+    if (!g_printedLines.insert(std::string("[X]") + message).second) return;
     Color::setForegroundColor(Color::Red);
     std::cout << "[X] ";
     Color::setForegroundColor(Color::White);
@@ -3161,16 +3739,15 @@ void Helper::printError(const std::string& message)
 
 void Helper::runSystemCommand(const char* command)
 {
-    std::string modifiedCommand = command;
+    // v1.2.2 bugfix: bounded runner - a hung child (DISM, pnputil, installer)
+    // must not freeze the tool forever; default budget 10 minutes
+    std::string modifiedCommand = command ? command : "";
+    if (modifiedCommand.empty()) return;
     if (modifiedCommand.find("2>nul") == std::string::npos &&
         modifiedCommand.find("2>&1") == std::string::npos) {
         modifiedCommand += " 2>nul";
     }
-    FILE* stream = _popen(modifiedCommand.c_str(), "r");
-    if (stream == NULL) return;
-    char buffer[1024];
-    while (fgets(buffer, sizeof(buffer), stream) != NULL) {}
-    _pclose(stream);
+    runBoundedCommand(modifiedCommand.c_str(), 10 * 60 * 1000, NULL, NULL);
 }
 
 int Helper::runSystemCommandExitCode(const char* command)
@@ -3181,11 +3758,12 @@ int Helper::runSystemCommandExitCode(const char* command)
         modifiedCommand.find("2>&1") == std::string::npos) {
         modifiedCommand += " 2>nul";
     }
-    FILE* stream = _popen(modifiedCommand.c_str(), "r");
-    if (stream == NULL) return -1;
-    char buffer[1024];
-    while (fgets(buffer, sizeof(buffer), stream) != NULL) {}
-    return _pclose(stream);
+    // v1.2.2 bugfix: bounded - pnputil/dism hang used to block forever
+    DWORD exitCode = (DWORD)-1;
+    int rc = runBoundedCommand(modifiedCommand.c_str(), 10 * 60 * 1000, NULL, &exitCode);
+    if (rc == 1) return -2;   // timed out (distinct from real exit codes)
+    if (rc < 0) return -1;
+    return static_cast<int>(exitCode);
 }
 
 bool Helper::readDwordValueRegistry(HKEY hKeyParent, LPCSTR subkey, LPCSTR valueName, DWORD* readData) {
