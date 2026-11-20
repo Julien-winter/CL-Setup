@@ -12,6 +12,26 @@ int main(int argc, char* argv[])
         return 0;
     }
 
+    // v1.2.3 bugfix: a second instance writing into the SAME console interleaved
+    // its output with the already running one - identical check lines appeared
+    // back to back (e.g. "- Fast-Boot is disabled" twice). One instance per
+    // session now: the second start gets a short notice and exits instead of
+    // mixing its lines into the running check.
+    HANDLE hSingleInstance = CreateMutexA(NULL, TRUE, "Local\\CL-Setup-Running");
+    if (hSingleInstance != NULL && GetLastError() == ERROR_ALREADY_EXISTS) {
+        Color::setForegroundColor(Color::Yellow);
+        std::cout << "[-] CL-Setup is already running - a second window would only mix up the output.\n";
+        std::cout << "    Close the other window first, then start it again.\n";
+        Color::setForegroundColor(Color::LightGray);
+        if (!Helper::cliConfig.headless) {
+            std::cout << "\nPress any key to exit...";
+            std::cin.get();
+        }
+        return 1;
+    }
+    // hSingleInstance is intentionally kept open for the whole process lifetime
+    // (released by the OS on exit) - closing it would reopen the race
+
     if (!Helper::isAdmin()) {
         Color::setForegroundColor(Color::Red);
         std::cout << "[!] This program requires administrator privileges.\n";
