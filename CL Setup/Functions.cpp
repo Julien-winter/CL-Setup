@@ -1179,39 +1179,6 @@ void Helper::logAppliedChange(const std::string& change)
     }
 }
 
-// v1.2.2: restore point as the FIRST action of the apply phase (before any
-// write), with visible failure and a marker the undo script can verify -
-// the old inline version ran after the first writes and swallowed all errors
-void Helper::createRestorePoint()
-{
-    HINSTANCE hSrDll = LoadLibraryA("srclient.dll");
-    if (hSrDll) {
-        typedef BOOL(WINAPI* SRSetRestorePointFn)(PRESTOREPOINTINFOW, PSTATEMGRSTATUS);
-        SRSetRestorePointFn SRSetRestorePoint = (SRSetRestorePointFn)GetProcAddress(hSrDll, "SRSetRestorePointW");
-        if (SRSetRestorePoint) {
-            RESTOREPOINTINFOW rp;
-            rp.dwEventType = BEGIN_SYSTEM_CHANGE;
-            rp.dwRestorePtType = MODIFY_SETTINGS;
-            rp.llSequenceNumber = 0;
-            std::wstring desc = L"CL-Setup v" + std::wstring(g_appVersion.begin(), g_appVersion.end()) + L" - Setup changes";
-            wcsncpy_s(rp.szDescription, desc.c_str(), _TRUNCATE);
-            STATEMGRSTATUS sms = {};
-            if (SRSetRestorePoint(&rp, &sms)) {
-                rp.dwEventType = END_SYSTEM_CHANGE;
-                SRSetRestorePoint(&rp, &sms);
-                printSuccess("- System Restore Point created", true);
-                logAppliedChange("restorepoint:created");
-                FreeLibrary(hSrDll);
-                return;
-            }
-        }
-        FreeLibrary(hSrDll);
-    }
-    // System Protection is disabled by default on many systems - say so instead
-    // of silently pretending a restore point exists (Undo used to claim that)
-    printConcern("- Could not create a restore point (System Protection may be disabled)");
-}
-
 ServiceStatus Helper::getServiceStatus(LPCSTR serviceName)
 {
     SC_HANDLE scmHandle = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
@@ -1559,9 +1526,9 @@ void Checks::checkSecurityMitigations()
         return value;
     };
 
-    // v1.2.2: restore point moved out - it used to be created HERE, AFTER the
-    // setDword writes above, so it could not roll back those writes (see
-    // Helper::createRestorePoint, now called at the start of the apply phase)
+    // v1.2.3: no system restore point is created anymore (see apply phase) -
+    // Undo-CL-Setup.ps1 reverts the setDword writes above from the
+    // %TEMP%\CL-Setup\Backup exports taken before them + markers
 
     std::string bcdOutput = lower(Helper::runSystemCommandWithOutput("bcdedit /enum {current}", 5000));
     // v1.2.2: evaluate ONLY the hypervisorlaunchtype line - searching the whole

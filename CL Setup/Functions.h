@@ -146,9 +146,6 @@ namespace Helper {
     // Appends one applied change to %LOCALAPPDATA%\CL-Setup\applied-changes.log;
     // Undo-CL-Setup.ps1 reads it to revert exactly what this run changed
     void logAppliedChange(const std::string& change);
-    // v1.2.2: creates the system restore point BEFORE the apply phase writes;
-    // logs restorepoint:created on success so Undo-CL-Setup.ps1 can verify it
-    void createRestorePoint();
 
     bool isAdmin();
     void initLogging();

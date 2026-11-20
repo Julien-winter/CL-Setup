@@ -219,9 +219,11 @@ int main(int argc, char* argv[])
             Color::setForegroundColor(Color::LightGray);
             std::cout << "-----------------------------------------------------------------\n";
 
-            // v1.2.2: restore point FIRST - it used to be created after the
-            // first registry writes and could not roll them back
-            Helper::createRestorePoint();
+            // v1.2.3: NO system restore point anymore - it was invisible in
+            // System Restore on the target machines and duplicated what
+            // Undo-CL-Setup.ps1 already does via the %TEMP%\CL-Setup\Backup
+            // exports + applied-changes.log markers (every registry write is
+            // exported before it happens)
 
             if (!Helper::isCheckSkipped(1)) Checks::checkWindowsDefender();
             if (!Helper::isCheckSkipped(2)) Checks::check3rdPartyAntiVirus();
