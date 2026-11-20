@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
     Undo-CL-Setup.ps1
-    Reverts the changes made by CL Setup v1.2.1.
+    Reverts the changes made by CL Setup.
 
     CL Setup appends every non-trivial change to:
         %LOCALAPPDATA%\CL-Setup\applied-changes.log

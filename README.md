@@ -10,6 +10,22 @@ The purpose of this program is to help the user setup the CL Client by doing all
 
 ## Changes & Bug Fixes
 
+### v1.2.2
+
+**Added**
+- New check **28 = Activation** (strictly read-only): reports the Windows activation state via `SoftwareLicensingProduct.LicenseStatus` - it never activates, installs a key or touches the watermark
+- **Mainboard detection** (ASUS / MSI / Gigabyte / ASRock / Dell / HP / Lenovo / Acer / Medion / ...) with a short BIOS path hint **in the same line** whenever something has to be disabled in the firmware, e.g. `TPM is enabled ... [ASUS: Advanced > fTPM Config > Off]` (also for Secure Boot and CPU virtualization)
+- Network adapter lines now show *why* an adapter is kept or removed (`[virtual]` / `[hardware]` / `[loopback]`), and every pending removal lists the PnP device instance + classification reason
+
+**Fixed**
+- Unused virtual adapters stayed behind (`LAN-Verbindung* 13/14`, `Microsoft KM-TEST`, Tailscale/Wintun leftovers): the marker contained a typo (`microsoft km--test` never matched) and adapters were judged by name only. Adapters are now classified by friendly-name markers **and** by the PnP device-instance bus - devices on `PCI\`, `USB\`, `NVME\`... are hardware and are never touched, while `ROOT\`, `SWD\`, `VMBUS\`... leftovers are actually removed (unknown devices are conservatively kept)
+- Adapters without a PnP device instance (e.g. `eth0` in a VM) are no longer proposed for removal - `pnputil /remove-device` can never succeed without one
+- Final summary undercounted checks (`17 passed`): results are no longer wiped before the apply phase and each check's result is updated in place, so all checks from both phases are counted
+- Core Isolation: when HVCI was pending approval the VBS change was never added to the pending list (early `return`) - both pendings are now registered, and the check records exactly one combined result
+- Security Mitigations: a pending hypervisor change returned early *without* recording a result and skipped registering the Hyper-V feature pendings
+- Console colors are now switched on explicitly (VT processing) - no more raw `[38;2;255;255;255m` escape codes on consoles that do not enable them by default
+- `--skip` / `--only` help text now covers checks 1-28
+
 ### v1.2.1
 
 **Added**

@@ -151,6 +151,10 @@ int main(int argc, char* argv[])
     if (!Helper::isCheckSkipped(27)) Checks::checkSpoofer();
     else { Helper::printConcern("- Skipped: HWID Spoofer"); Helper::recordResult("HWID Spoofer", "SKIPPED", ""); }
 
+    // v1.2.2: read-only - never re-run in the apply phase (no requestChange)
+    if (!Helper::isCheckSkipped(28)) Checks::checkActivation();
+    else { Helper::printConcern("- Skipped: Activation"); Helper::recordResult("Activation", "SKIPPED", ""); }
+
     // Count warnings and failures
     for (const auto& r : Helper::g_results) {
         if (r.status == "WARN") warningCount++;
@@ -168,7 +172,9 @@ int main(int argc, char* argv[])
         if (approved) {
             Helper::applyChanges = true;
             Helper::clearPendingChanges();
-            Helper::clearResults();
+            // v1.2.2: do NOT clear results here - recordResult upserts per check, so the
+            // final summary keeps every check from both phases (all checks, not just the
+            // 18 re-run ones)
             Helper::vcComplete = false;
             Helper::vcCheckSleepTimes = 0;
 

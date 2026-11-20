@@ -17,7 +17,7 @@ namespace Helper {
     bool applyChanges = false;
     std::string g_repoUrl = "Julien-winter/CL-Setup";
     std::string g_appName = "CL-Setup";
-    std::string g_appVersion = "1.2.1";
+    std::string g_appVersion = "1.2.2";
     int g_exitCode = 0;
 }
 
@@ -72,26 +72,139 @@ namespace {
         return result;
     }
 
-    // Only loopback / real virtual devices are ever candidates for removal - never a physical NIC
-    bool isVirtualAdapter(const std::string& friendlyName, const IP_ADAPTER_ADDRESSES* adapter)
+    bool startsWithLower(const std::string& lowerValue, const char* lowerPrefix)
+    {
+        std::string prefix = lowerPrefix;
+        return lowerValue.size() >= prefix.size() &&
+            lowerValue.compare(0, prefix.size(), prefix) == 0;
+    }
+
+    // v1.2.2: a device instance on one of these buses is real hardware and is
+    // NEVER a removal candidate (ROOT\, SWD\, VMBUS\, TAP\, BTH\... are not listed)
+    bool isHardwareBusInstance(const std::string& instanceId)
+    {
+        if (instanceId.empty()) return false;
+        static const char* hardwarePrefixes[] = {
+            "pci\\", "usb\\", "pcmcia\\", "1394\\", "scsi\\", "sas\\", "nvme\\",
+            "ide\\", "fibre\\", "mmc\\", "ufs\\", "gpe\\", "acpi\\"
+        };
+        std::string lower = toLowerCopy(instanceId);
+        for (const char* prefix : hardwarePrefixes) {
+            if (startsWithLower(lower, prefix)) return true;
+        }
+        return false;
+    }
+
+    // Only loopback / real virtual devices are ever candidates for removal - never a physical NIC.
+    // v1.2.2 rework: classify by (a) friendly-name markers, (b) the PnP device-instance bus.
+    // Unknown instance -> treated as hardware (conservative: never remove what we cannot prove).
+    bool isVirtualAdapter(const std::string& friendlyName, const IP_ADAPTER_ADDRESSES* adapter,
+                          const std::string& instanceId, std::string* reason)
     {
         if (adapter == NULL) return false;
         if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK) return false;
-        if (adapter->IfType == IF_TYPE_PPP || adapter->IfType == IF_TYPE_SLIP || adapter->IfType == IF_TYPE_TUNNEL) return true;
-        if (adapter->PhysicalAddressLength == 0) return true;
 
         std::string name = toLowerCopy(friendlyName);
+
+        // (a) name markers win over the bus check - VMware/VBox sit on PCI\ but are virtual
         static const char* virtualMarkers[] = {
             "vethernet", "hyper-v", "vmware", "virtualbox", "vbox", "bluetooth", "wan miniport",
-            "microsoft km--test", "microsoft wi-fi direct", "microsoft loopback", "isatap", "teredo",
+            "km-test", "microsoft wi-fi direct", "microsoft loopback", "isatap", "teredo",
             "6to4", "vpn", "tap", "tun", "wireguard", "nordlynx", "proton", "windscribe", "mullvad",
             "expressvpn", "openvpn", "softether", "anyconnect", "hamachi", "zerotier", "npcap",
-            "wsl", "docker", "network bridge", "layered", "pan ", "hyper-v", "virtual"
+            "wsl", "docker", "network bridge", "layered", "pan ", "virtual",
+            // v1.2.2: leftovers that stayed behind in v1.2.1
+            "lan-verbindung*", "tailscale", "wintun"
         };
         for (const char* marker : virtualMarkers) {
-            if (name.find(marker) != std::string::npos) return true;
+            if (name.find(marker) != std::string::npos) {
+                if (reason != NULL) *reason = std::string("name marker '") + marker + "'";
+                return true;
+            }
         }
-        return false;
+
+        if (adapter->IfType == IF_TYPE_PPP || adapter->IfType == IF_TYPE_SLIP ||
+            adapter->IfType == IF_TYPE_TUNNEL) {
+            if (reason != NULL) *reason = "software link (PPP/SLIP/tunnel)";
+            return true;
+        }
+
+        // (b) bus classification via the PnP device instance
+        if (instanceId.empty()) {
+            return false; // unknown device -> conservative, keep it
+        }
+        if (isHardwareBusInstance(instanceId)) {
+            return false;
+        }
+        if (reason != NULL) {
+            *reason = "virtual bus device (" + instanceId + ")";
+        }
+        return true;
+    }
+
+    // v1.2.2: mainboard vendor from the firmware registry block (SMBIOS mirror)
+    std::string mainboardVendor()
+    {
+        std::string vendor = readRegistryStringValue(HKEY_LOCAL_MACHINE,
+            "HARDWARE\\DESCRIPTION\\System\\BIOS", "BaseBoardManufacturer");
+        if (vendor.empty()) {
+            vendor = readRegistryStringValue(HKEY_LOCAL_MACHINE,
+                "HARDWARE\\DESCRIPTION\\System\\BIOS", "SystemManufacturer");
+        }
+        std::string v = toLowerCopy(trimCopy(vendor));
+        if (v.empty()) return "";
+        if (v.find("asus") != std::string::npos) return "ASUS";
+        if (v.find("micro-star") != std::string::npos || v == "msi") return "MSI";
+        if (v.find("gigabyte") != std::string::npos) return "Gigabyte";
+        if (v.find("asrock") != std::string::npos) return "ASRock";
+        if (v.find("alienware") != std::string::npos || v.find("dell") != std::string::npos) return "Dell";
+        if (v.find("hewlett") != std::string::npos || v == "hp" || v.find("compaq") != std::string::npos) return "HP";
+        if (v.find("lenovo") != std::string::npos || v.find("ibm") != std::string::npos) return "Lenovo";
+        if (v.find("acer") != std::string::npos) return "Acer";
+        if (v.find("medion") != std::string::npos) return "Medion";
+        if (v.find("toshiba") != std::string::npos) return "Toshiba";
+        if (v.find("supermicro") != std::string::npos) return "Supermicro";
+        if (v.find("evga") != std::string::npos) return "EVGA";
+        return "";
+    }
+
+    // v1.2.2: SHORT BIOS path for the detected board, appended in the SAME line
+    // topic: "tpm" | "secureboot" | "cpuv"
+    std::string biosHint(const char* topic)
+    {
+        const std::string t = topic;
+        const std::string vendor = mainboardVendor();
+        std::string path;
+
+        if (t == "tpm") {
+            if (vendor == "ASUS") path = "Advanced > fTPM Config > Off";
+            else if (vendor == "MSI") path = "Security > fTPM/PTT > Off";
+            else if (vendor == "Gigabyte") path = "Settings > fTPM > Off";
+            else if (vendor == "ASRock") path = "Advanced > CPU Config > fTPM";
+            else if (vendor == "Dell" || vendor == "HP" || vendor == "Lenovo")
+                path = "Security > TPM > Off";
+            else path = "BIOS > Security > TPM > Off";
+        }
+        else if (t == "secureboot") {
+            if (vendor == "ASUS" || vendor == "Gigabyte") path = "Boot > Secure Boot > Disabled";
+            else if (vendor == "MSI") path = "Security > Secure Boot > Disabled";
+            else if (vendor == "ASRock") path = "Security > Secure Boot > Disabled";
+            else if (vendor == "Dell" || vendor == "HP" || vendor == "Lenovo")
+                path = "Security > Secure Boot > Disabled";
+            else path = "BIOS > Secure Boot > Disabled";
+        }
+        else { // "cpuv"
+            if (vendor == "ASUS") path = "Advanced > CPU Config > VT-x";
+            else if (vendor == "MSI") path = "OC > CPU Features > VT-x";
+            else if (vendor == "Gigabyte") path = "Tweaker > VT-x / SVM Mode";
+            else if (vendor == "ASRock") path = "Advanced > CPU Config > VT-x/SVM";
+            else if (vendor == "Dell") path = "CPU > VT-x";
+            else if (vendor == "HP") path = "Security > VT-x";
+            else if (vendor == "Lenovo") path = "Config > CPU > VT-x";
+            else path = "BIOS > CPU Config > VT-x";
+        }
+
+        return "[" + (vendor.empty() ? std::string("BIOS") : vendor) + ": " + path + "]";
     }
 
     // Maps adapter GUID (from GetAdaptersAddresses) to the PnP device instance id used by pnputil
@@ -391,6 +504,17 @@ namespace {
 void Helper::recordResult(const std::string& check, const std::string& status, const std::string& message)
 {
     std::lock_guard<std::mutex> lock(g_resultsMutex);
+    // v1.2.2: upsert instead of append. A check re-run in the apply phase replaces its
+    // initial entry (fresh status), so the final summary counts every check exactly once
+    // instead of only the partial apply re-run ("17 passed" bug).
+    for (auto& result : g_results) {
+        if (result.check == check) {
+            result.status = status;
+            result.message = message;
+            logWrite("  [" + status + "] " + check + " - " + message);
+            return;
+        }
+    }
     g_results.push_back({check, status, message});
     logWrite("  [" + status + "] " + check + " - " + message);
 }
@@ -617,8 +741,8 @@ void Helper::showHelp()
     std::cout << "  --quiet             Only show errors and warnings\n";
     std::cout << "  --apply             Apply needed changes without prompting\n";
     std::cout << "  --export FILE       Export results as JSON to FILE\n";
-    std::cout << "  --skip N[,M,...]    Skip specific checks by number (1-27)\n";
-    std::cout << "  --only N[,M,...]    Run only specific checks by number (1-27)\n\n";
+    std::cout << "  --skip N[,M,...]    Skip specific checks by number (1-28)\n";
+    std::cout << "  --only N[,M,...]    Run only specific checks by number (1-28)\n\n";
     std::cout << "Check Numbers:\n";
     std::cout << "  1=WindowsDefender 2=3rdPartyAV 3=SecureBoot 4=RiotVanguard\n";
     std::cout << "  5=VCRedist 6=Chrome 7=ChromeProtection 8=TimeSync 9=Winver\n";
@@ -626,7 +750,7 @@ void Helper::showHelp()
     std::cout << "  14=GameBar 15=TPM 16=CoreIsolation 17=DMAProtection 18=ModifiedOS\n";
     std::cout << "  19=Internet 20=NetworkAdapters 21=VM-Detect 22=Auto-Update\n";
     std::cout << "  23=SecurityMitigations 24=UAC 25=WindowsUpdate\n";
-    std::cout << "  26=CPU-V 27=HWID-Spoofer\n";
+    std::cout << "  26=CPU-V 27=HWID-Spoofer 28=Activation\n";
 }
 
 CLIConfig Helper::parseCLI(int argc, char* argv[])
@@ -948,7 +1072,17 @@ void Checks::checkNetworkAdapters()
     int total = 0;
     int used = 0;
     std::string summary;
-    std::vector<std::pair<std::string, std::string>> unusedVirtual; // {friendly name, adapter GUID}
+    // v1.2.2: classify with the device instance already in hand (collected BEFORE the
+    // approval prompt) so each candidate carries proof of being virtual
+    std::map<std::string, std::string> deviceInstances;
+    collectNetAdapterInstances(deviceInstances);
+
+    struct UnusedCandidate {
+        std::string name;
+        std::string instanceId;
+        std::string reason;
+    };
+    std::vector<UnusedCandidate> unusedVirtual;
 
     for (PIP_ADAPTER_ADDRESSES adapter = adapters; adapter != NULL; adapter = adapter->Next) {
         total++;
@@ -961,19 +1095,32 @@ void Checks::checkNetworkAdapters()
             name = "Unknown adapter";
         }
 
+        std::string instanceId;
+        if (adapter->AdapterName != NULL) {
+            auto device = deviceInstances.find(toLowerCopy(adapter->AdapterName));
+            if (device != deviceInstances.end()) {
+                instanceId = device->second;
+            }
+        }
+
         bool hasAddress = adapter->FirstUnicastAddress != NULL;
         bool hasGateway = adapter->FirstGatewayAddress != NULL;
         bool isLoopback = adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK;
         bool isUsed = adapter->OperStatus == IfOperStatusUp && !isLoopback && (hasAddress || hasGateway);
+        std::string reason;
+        bool virtualCandidate = !isLoopback && isVirtualAdapter(name, adapter, instanceId, &reason);
+        // v1.2.2: only propose removal when we actually have a device instance -
+        // pnputil cannot remove anything without one (seen with "eth0" in a VM)
         if (isUsed) used++;
-        else if (!isLoopback && isVirtualAdapter(name, adapter)) {
-            unusedVirtual.push_back({ name,
-                adapter->AdapterName != NULL ? std::string(adapter->AdapterName) : std::string() });
+        else if (virtualCandidate && !instanceId.empty()) {
+            unusedVirtual.push_back({ name, instanceId, reason });
         }
 
         std::string line = name + " - " + (isUsed ? "USED" : "NOT USED") +
             " (" + statusToString(adapter->OperStatus) + ")";
         if (isLoopback) line += " [loopback]";
+        else if (virtualCandidate) line += " [virtual]";
+        else if (!isUsed) line += instanceId.empty() ? " [unknown]" : " [hardware]";
 
         if (isUsed) {
             Helper::printSuccess("- Adapter: " + line, false);
@@ -1000,10 +1147,17 @@ void Checks::checkNetworkAdapters()
         return;
     }
 
+    auto describe = [](const UnusedCandidate& entry) {
+        std::string text = entry.name;
+        if (!entry.instanceId.empty()) text += " (" + entry.instanceId + ")";
+        if (!entry.reason.empty()) text += " - " + entry.reason;
+        return text;
+    };
+
     std::string names;
     for (const auto& entry : unusedVirtual) {
         if (!names.empty()) names += ", ";
-        names += entry.first;
+        names += describe(entry);
     }
 
     if (!Helper::requestChange("Uninstall unused virtual network adapter(s): " + names)) {
@@ -1012,33 +1166,35 @@ void Checks::checkNetworkAdapters()
         return;
     }
 
-    std::map<std::string, std::string> deviceInstances;
-    collectNetAdapterInstances(deviceInstances);
-
     int removed = 0;
     for (const auto& entry : unusedVirtual) {
-        auto device = deviceInstances.find(toLowerCopy(entry.second));
-        if (entry.second.empty() || device == deviceInstances.end()) {
-            Helper::printInfo("No device instance found for adapter: " + entry.first);
+        if (entry.instanceId.empty()) {
+            Helper::printInfo("No device instance found for adapter: " + entry.name);
             continue;
         }
 
-        std::string command = "pnputil /remove-device \"" + device->second + "\"";
+        std::string command = "pnputil /remove-device \"" + entry.instanceId + "\"";
         int exitCode = Helper::runSystemCommandExitCode(command.c_str());
         if (exitCode == 0) {
-            Helper::printSuccess("- Removed unused virtual adapter: " + entry.first, true);
-            appendRemovedAdapterLog(device->second, entry.first);
+            Helper::printSuccess("- Removed unused virtual adapter: " + entry.name, true);
+            appendRemovedAdapterLog(entry.instanceId, entry.name);
             removed++;
         }
         else {
-            Helper::printError("- Could not remove adapter " + entry.first +
+            Helper::printError("- Could not remove adapter " + entry.name +
                 " (pnputil exit " + std::to_string(exitCode) + ")");
         }
     }
 
+    std::string namesShort;
+    for (const auto& entry : unusedVirtual) {
+        if (!namesShort.empty()) namesShort += ", ";
+        namesShort += entry.name;
+    }
+
     Helper::recordResult("Network Adapters", removed > 0 ? "OK" : "WARN",
         usage + "; removed " + std::to_string(removed) + "/" +
-        std::to_string(unusedVirtual.size()) + " unused virtual adapter(s): " + names);
+        std::to_string(unusedVirtual.size()) + " unused virtual adapter(s): " + namesShort);
 }
 
 void Checks::checkSecurityMitigations()
@@ -1170,13 +1326,16 @@ void Checks::checkSecurityMitigations()
         if (!Helper::requestChange("Set hypervisorlaunchtype to off")) {
             appendSummary("hypervisorlaunchtype=change pending");
             warning = true;
-            return;
+            // v1.2.2: NO early return here - keep going so the Hyper-V feature
+            // pendings below are registered too, and so a result is always recorded
         }
-        Helper::runSystemCommand("bcdedit /set hypervisorlaunchtype off");
-        Helper::logAppliedChange("bcdedit:hypervisorlaunchtype=off");
-        Helper::printSuccess("- Set hypervisor launch type to off", true);
-        appendSummary("hypervisorlaunchtype=changed to off");
-        changed = true;
+        else {
+            Helper::runSystemCommand("bcdedit /set hypervisorlaunchtype off");
+            Helper::logAppliedChange("bcdedit:hypervisorlaunchtype=off");
+            Helper::printSuccess("- Set hypervisor launch type to off", true);
+            appendSummary("hypervisorlaunchtype=changed to off");
+            changed = true;
+        }
     }
 
     auto checkAndDisableFeature = [&](const std::string& featureName) {
@@ -1898,7 +2057,7 @@ void Checks::checkSecureBoot()
         Helper::recordResult("Secure Boot", "OK", "Disabled (UEFI)");
     }
     else if (secbootStatus == 0x00000001) {
-        Helper::printError("- Secure-Boot is enabled, please disable Secure-Boot in your BIOS");
+        Helper::printError("- Secure-Boot is enabled, disable it in BIOS " + biosHint("secureboot"));
         Helper::recordResult("Secure Boot", "FAIL", "Enabled");
     }
     else {
@@ -2387,7 +2546,7 @@ void Checks::checkTPMStatus()
                           (readyRead && ready == 1);
 
         if (tpmPresent && tpmRunning) {
-            Helper::printError("- TPM is enabled" + detail + ", please disable TPM in your BIOS");
+            Helper::printError("- TPM is enabled" + detail + ", disable it in BIOS " + biosHint("tpm"));
             Helper::recordResult("TPM", "FAIL", "Enabled" + detail);
         }
         else if (tpmPresent) {
@@ -2428,12 +2587,12 @@ void Checks::checkTPMStatus()
     std::string wmiDetail = spec.empty() ? "" : " (" + spec + ")";
 
     if (tpmEnabledFlag && tpmActivatedFlag) {
-        Helper::printError("- TPM is enabled" + wmiDetail + ", please disable TPM in your BIOS");
+        Helper::printError("- TPM is enabled" + wmiDetail + ", disable it in BIOS " + biosHint("tpm"));
         Helper::recordResult("TPM", "FAIL", "Enabled" + wmiDetail);
     }
     else if (tpmEnabledFlag || tpmActivatedFlag) {
         Helper::printConcern("- TPM is partially available (Enabled=" + isEnabled +
-            ", Activated=" + isActivated + ")" + wmiDetail);
+            ", Activated=" + isActivated + ")" + wmiDetail + " " + biosHint("tpm"));
         Helper::recordResult("TPM", "WARN", "Partially available" + wmiDetail);
     }
     else {
@@ -2465,15 +2624,32 @@ void Checks::checkCoreIsolation()
         return;
     }
 
+    // v1.2.2: register BOTH pendings before returning. The old early return after the
+    // first unapproved change silently dropped the VBS pending from the approval list.
+    bool hvciApproved = (hvci != 1) || Helper::requestChange("Disable Core Isolation HVCI");
+    bool vbsApproved = (vbs != 1) || Helper::requestChange("Disable Virtualization Based Security");
+    if (!hvciApproved || !vbsApproved) {
+        std::string pending;
+        if (hvci == 1) pending += "HVCI";
+        if (vbs == 1) {
+            if (!pending.empty()) pending += " + ";
+            pending += "VBS";
+        }
+        Helper::recordResult("Core Isolation", "WARN", pending + " enabled - disable pending approval");
+        return;
+    }
+
     bool changed = false;
+    std::string changedList;
+    std::string failedList;
     HKEY hKey;
 
-    if (hvci == 1) {
-        if (!Helper::requestChange("Disable Core Isolation HVCI")) {
-            Helper::recordResult("Core Isolation", "WARN", "HVCI enabled - disable pending approval");
-            return;
-        }
+    auto appendName = [](std::string& list, const char* name) {
+        if (!list.empty()) list += " + ";
+        list += name;
+    };
 
+    if (hvci == 1) {
         if (RegCreateKeyEx(HKEY_LOCAL_MACHINE,
             "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity",
             0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
@@ -2481,24 +2657,22 @@ void Checks::checkCoreIsolation()
             if (RegSetValueEx(hKey, "Enabled", 0, REG_DWORD, (BYTE*)&val, sizeof(val)) == ERROR_SUCCESS) {
                 Helper::logAppliedChange("reg:SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity");
                 Helper::printSuccess("- Disabled HVCI", true);
-                Helper::recordResult("Core Isolation", "OK", "HVCI disabled (changed)");
+                appendName(changedList, "HVCI");
                 changed = true;
             }
             else {
                 Helper::printError("- Failed to disable HVCI (access denied?)");
                 Helper::printConcern("  Disable manually: Windows Security > Device Security > Core Isolation");
-                Helper::recordResult("Core Isolation", "FAIL", "HVCI write failed");
+                appendName(failedList, "HVCI");
             }
             RegCloseKey(hKey);
+        }
+        else {
+            appendName(failedList, "HVCI");
         }
     }
 
     if (vbs == 1) {
-        if (!Helper::requestChange("Disable Virtualization Based Security")) {
-            Helper::recordResult("Core Isolation", "WARN", "VBS enabled - disable pending approval");
-            return;
-        }
-
         if (RegCreateKeyEx(HKEY_LOCAL_MACHINE,
             "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard",
             0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
@@ -2506,19 +2680,35 @@ void Checks::checkCoreIsolation()
             if (RegSetValueEx(hKey, "EnableVirtualizationBasedSecurity", 0, REG_DWORD, (BYTE*)&val, sizeof(val)) == ERROR_SUCCESS) {
                 Helper::logAppliedChange("reg:SYSTEM\\CurrentControlSet\\Control\\DeviceGuard");
                 if (!changed) Helper::printSuccess("- Disabled VBS", true);
-                Helper::recordResult("Core Isolation", "OK", "VBS disabled (changed)");
+                appendName(changedList, "VBS");
                 changed = true;
             }
+            else {
+                appendName(failedList, "VBS");
+            }
             RegCloseKey(hKey);
+        }
+        else {
+            appendName(failedList, "VBS");
         }
     }
 
     if (changed) {
         Helper::restartRequired = true;
     }
-    else if (hvci == 1 || vbs == 1) {
+
+    // v1.2.2: exactly one result per check (upsert keeps the last one anyway)
+    if (changed && failedList.empty()) {
+        Helper::recordResult("Core Isolation", "OK", changedList + " disabled (changed)");
+    }
+    else if (changed) {
+        Helper::recordResult("Core Isolation", "WARN",
+            changedList + " disabled (changed); failed: " + failedList);
+    }
+    else if (!failedList.empty()) {
         Helper::printConcern("- Could not disable Core Isolation, disable manually in Windows Security");
-        Helper::recordResult("Core Isolation", "FAIL", "Manual disable needed");
+        Helper::recordResult("Core Isolation", "FAIL",
+            "Manual disable needed (" + failedList + " write failed)");
     }
     else {
         Helper::printSuccess("- Core Isolation (VBS/HVCI) is disabled", false);
@@ -2689,7 +2879,8 @@ void Checks::checkCPUVirtualization()
     if (firmwareEnabled) {
         std::string detail = "Enabled in BIOS (" + tech + ")";
         if (hypervisorPresent) detail += ", hypervisor active";
-        Helper::printConcern("- CPU-V is enabled in BIOS (" + tech + "). Consider disabling in BIOS if not needed");
+        Helper::printConcern("- CPU-V is enabled in BIOS (" + tech + "), disable it in BIOS if not needed " +
+            biosHint("cpuv"));
         Helper::recordResult("CPU-V", "WARN", detail);
     }
     else {
@@ -2800,12 +2991,90 @@ void Checks::checkSpoofer()
     }
 }
 
+// v1.2.2: read-only activation status - reports the state, never activates or
+// modifies anything (no key installation, no watermark tampering)
+void Checks::checkActivation()
+{
+    SetConsoleTitleA("Checking Activation Status");
+
+    std::string command =
+        "powershell -NoProfile -NonInteractive -Command \""
+        "$p = Get-CimInstance -ClassName SoftwareLicensingProduct | "
+        "Where-Object { $_.PartialProductKey -and $_.Name -like 'Windows*' } | Select-Object -First 1; "
+        "if ($p) { $p.LicenseStatus } else { 'NA' }\" 2>nul";
+    std::string out = trimCopy(Helper::runSystemCommandWithOutput(command.c_str(), 30000));
+    if (out == "TIMEOUT") out.clear();
+
+    // first token: a LicenseStatus digit, "NA", or PowerShell noise on failure
+    std::string token = out.substr(0, out.find_first_of("\r\n \t"));
+    bool numeric = !token.empty() &&
+        token.find_first_not_of("0123456789") == std::string::npos;
+
+    if (token.empty() || token == "NA" || !numeric) {
+        Helper::printConcern("- Could not read the Windows activation status");
+        Helper::recordResult("Activation", "WARN",
+            token.empty() ? "Status unreadable" :
+            (token == "NA" ? "No Windows product key found" : "Unexpected PowerShell output"));
+        return;
+    }
+
+    // SoftwareLicensingProduct.LicenseStatus
+    switch (atoi(token.c_str())) {
+    case 1:
+        Helper::printSuccess("- Windows is activated (licensed)", false);
+        Helper::recordResult("Activation", "OK", "Activated (licensed)");
+        break;
+    case 2:
+        Helper::printSuccess("- Windows is activated (out-of-box grace period)", false);
+        Helper::recordResult("Activation", "OK", "Activated (OOB grace)");
+        break;
+    case 3:
+        Helper::printSuccess("- Windows is activated (out-of-tolerance grace period)", false);
+        Helper::recordResult("Activation", "OK", "Activated (OOT grace)");
+        break;
+    case 0:
+        Helper::printConcern("- Windows is not activated - activate with a valid license key "
+            "(Settings > System > Activation)");
+        Helper::recordResult("Activation", "WARN",
+            "Not activated - activate with a valid license key");
+        break;
+    case 4:
+        Helper::printConcern("- Windows reports a non-genuine grace period");
+        Helper::recordResult("Activation", "WARN", "Non-genuine grace period");
+        break;
+    case 5:
+        Helper::printConcern("- Windows is in notification mode - the activation watermark "
+            "can be visible until a valid license key is entered");
+        Helper::recordResult("Activation", "WARN",
+            "Notification mode - activation watermark can be visible");
+        break;
+    case 6:
+        Helper::printConcern("- Windows is in extended grace period");
+        Helper::recordResult("Activation", "WARN", "Extended grace period");
+        break;
+    default:
+        Helper::printConcern("- Unknown activation state (LicenseStatus=" + token + ")");
+        Helper::recordResult("Activation", "WARN", "Unknown LicenseStatus " + token);
+        break;
+    }
+}
+
 void Helper::setupConsole()
 {
     HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
     DWORD mode = 0;
     GetConsoleMode(hStdin, &mode);
     SetConsoleMode(hStdin, mode & ~(ENABLE_QUICK_EDIT_MODE | ENABLE_EXTENDED_FLAGS));
+
+    // v1.2.2: enable ANSI/VT color sequences explicitly - consoles that never
+    // switch them on print raw escape codes like "[38;2;255;255;255m"
+    HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD outMode = 0;
+    if (hStdout != NULL && hStdout != INVALID_HANDLE_VALUE &&
+        GetConsoleMode(hStdout, &outMode)) {
+        SetConsoleMode(hStdout, outMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }
+
     SetConsoleTitleA("Initializing");
 
     // v1.2.1: start maximized so every check line is visible without scrolling

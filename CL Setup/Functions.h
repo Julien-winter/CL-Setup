@@ -104,6 +104,7 @@ namespace Checks {
 
     void checkCPUVirtualization();
     void checkSpoofer();
+    void checkActivation();
 }
 namespace Helper {
     extern bool restartRequired;

@@ -1,5 +1,5 @@
 @echo off
-REM Undo-CL-Setup - reverts the changes made by CL Setup v1.2.1
+REM Undo-CL-Setup - reverts the changes made by CL Setup
 REM Elevates to administrator if needed, then runs Undo-CL-Setup.ps1
 setlocal
 REM Admin check: reading the LOCAL SERVICE hive needs admin rights and does
