@@ -10,17 +10,13 @@ The purpose of this program is to help the user setup the CL Client by doing all
 
 ## Changes & Bug Fixes
 
-### v1.2.3
-
-**Changed**
-- The shop info box that appears after the "Apply setup changes?" dialog can now be turned off **silently**: set `showShopInfo=false` in `%TEMP%\CL-Setup\settings.ini`. The file is created with `showShopInfo=true` on the first run, nothing is ever printed in the console about it (values `false` / `0` / `no` / `off` are accepted, comments start with `#` or `;`)
-
 ### v1.2.2
 
 **Added**
 - New check **28 = Activation** (strictly read-only): reports the Windows activation state via `SoftwareLicensingProduct.LicenseStatus` - it never activates, installs a key or touches the watermark
 - **Mainboard detection** (ASUS / MSI / Gigabyte / ASRock / Dell / HP / Lenovo / Acer / Medion / ...) with a short BIOS path hint **in the same line** whenever something has to be disabled in the firmware, e.g. `TPM is enabled ... [ASUS: Advanced > fTPM Config > Off]` (also for Secure Boot and CPU virtualization)
 - Network adapter lines now show *why* an adapter is kept or removed (`[virtual]` / `[hardware]` / `[loopback]`), and every pending removal lists the PnP device instance + classification reason
+- The shop info box after the apply dialog can be turned off silently: set `showShopInfo=false` in `%TEMP%\CL-Setup\settings.ini` (created with `true` on the first run, nothing is printed in the console)
 
 **Fixed**
 - Unused virtual adapters stayed behind (`LAN-Verbindung* 13/14`, `Microsoft KM-TEST`, Tailscale/Wintun leftovers): the marker contained a typo (`microsoft km--test` never matched) and adapters were judged by name only. Adapters are now classified by friendly-name markers **and** by the PnP device-instance bus - devices on `PCI\`, `USB\`, `NVME\`... are hardware and are never touched, while `ROOT\`, `SWD\`, `VMBUS\`... leftovers are actually removed (unknown devices are conservatively kept)

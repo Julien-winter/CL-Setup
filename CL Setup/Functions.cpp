@@ -17,7 +17,7 @@ namespace Helper {
     bool applyChanges = false;
     std::string g_repoUrl = "Julien-winter/CL-Setup";
     std::string g_appName = "CL-Setup";
-    std::string g_appVersion = "1.2.3";
+    std::string g_appVersion = "1.2.2";
     int g_exitCode = 0;
 }
 
@@ -565,7 +565,7 @@ void Helper::printPendingChanges()
     }
 }
 
-// v1.2.3: %TEMP%\CL-Setup\settings.ini - edit showShopInfo=true -> false to
+// v1.2.2: %TEMP%\CL-Setup\settings.ini - edit showShopInfo=true -> false to
 // silence the promo box silently (no console output either way)
 namespace {
     std::string shopSettingsPath()
@@ -610,7 +610,7 @@ namespace {
 void Helper::showShopInfo()
 {
     if (cliConfig.headless) return;
-    // v1.2.3: opt-out via %TEMP%\CL-Setup\settings.ini (showShopInfo=false)
+    // v1.2.2: opt-out via %TEMP%\CL-Setup\settings.ini (showShopInfo=false)
     if (!shopInfoEnabled()) return;
     MessageBoxA(NULL,
         "You can buy alt accounts for cheap from shop.uchiha.us\n"
