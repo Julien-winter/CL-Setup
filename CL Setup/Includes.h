@@ -3,6 +3,10 @@
 #include <Windows.h>
 #include <winhttp.h>
 #include <iphlpapi.h>
+#include <setupapi.h>
+#include <intrin.h>
+#include <cstddef>
+#include <cstdlib>
 #include <iostream>
 #include <filesystem>
 #include <map>
@@ -25,3 +29,4 @@
 #pragma comment(lib, "urlmon.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "setupapi.lib")

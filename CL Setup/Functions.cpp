@@ -17,8 +17,372 @@ namespace Helper {
     bool applyChanges = false;
     std::string g_repoUrl = "Julien-winter/CL-Setup";
     std::string g_appName = "CL-Setup";
-    std::string g_appVersion = "1.2.0";
+    std::string g_appVersion = "1.2.1";
     int g_exitCode = 0;
+}
+
+namespace {
+    std::string toLowerCopy(const std::string& value)
+    {
+        std::string result = value;
+        std::transform(result.begin(), result.end(), result.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return result;
+    }
+
+    std::string trimCopy(const std::string& value)
+    {
+        const char* whitespace = " \t\r\n";
+        size_t start = value.find_first_not_of(whitespace);
+        if (start == std::string::npos) return "";
+        size_t end = value.find_last_not_of(whitespace);
+        return value.substr(start, end - start + 1);
+    }
+
+    // "5,6,7,8" style CSV without matching 3 inside 13/23/30
+    bool csvContains(const std::string& csv, int value)
+    {
+        std::string token;
+        for (size_t i = 0; i <= csv.size(); i++) {
+            if (i == csv.size() || csv[i] == ',') {
+                std::string trimmed = trimCopy(token);
+                if (!trimmed.empty() && atoi(trimmed.c_str()) == value) return true;
+                token.clear();
+            }
+            else {
+                token += csv[i];
+            }
+        }
+        return false;
+    }
+
+    std::string readRegistryStringValue(HKEY root, const char* subkey, const char* valueName)
+    {
+        HKEY hKey;
+        if (RegOpenKeyExA(root, subkey, 0, KEY_READ, &hKey) != ERROR_SUCCESS) return "";
+        char buffer[512] = { 0 };
+        DWORD size = sizeof(buffer);
+        DWORD type = 0;
+        std::string result;
+        if (RegQueryValueExA(hKey, valueName, NULL, &type, reinterpret_cast<LPBYTE>(buffer), &size) == ERROR_SUCCESS &&
+            (type == REG_SZ || type == REG_EXPAND_SZ)) {
+            result.assign(buffer);
+        }
+        RegCloseKey(hKey);
+        return result;
+    }
+
+    // Only loopback / real virtual devices are ever candidates for removal - never a physical NIC
+    bool isVirtualAdapter(const std::string& friendlyName, const IP_ADAPTER_ADDRESSES* adapter)
+    {
+        if (adapter == NULL) return false;
+        if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK) return false;
+        if (adapter->IfType == IF_TYPE_PPP || adapter->IfType == IF_TYPE_SLIP || adapter->IfType == IF_TYPE_TUNNEL) return true;
+        if (adapter->PhysicalAddressLength == 0) return true;
+
+        std::string name = toLowerCopy(friendlyName);
+        static const char* virtualMarkers[] = {
+            "vethernet", "hyper-v", "vmware", "virtualbox", "vbox", "bluetooth", "wan miniport",
+            "microsoft km--test", "microsoft wi-fi direct", "microsoft loopback", "isatap", "teredo",
+            "6to4", "vpn", "tap", "tun", "wireguard", "nordlynx", "proton", "windscribe", "mullvad",
+            "expressvpn", "openvpn", "softether", "anyconnect", "hamachi", "zerotier", "npcap",
+            "wsl", "docker", "network bridge", "layered", "pan ", "hyper-v", "virtual"
+        };
+        for (const char* marker : virtualMarkers) {
+            if (name.find(marker) != std::string::npos) return true;
+        }
+        return false;
+    }
+
+    // Maps adapter GUID (from GetAdaptersAddresses) to the PnP device instance id used by pnputil
+    void collectNetAdapterInstances(std::map<std::string, std::string>& out)
+    {
+        static const GUID kGuidDevClassNet =
+            { 0x4d36e972, 0xe325, 0x11ce, { 0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18 } };
+
+        HDEVINFO deviceInfo = SetupDiGetClassDevsA(&kGuidDevClassNet, NULL, NULL, DIGCF_PRESENT);
+        if (deviceInfo == INVALID_HANDLE_VALUE) return;
+
+        SP_DEVINFO_DATA data;
+        ZeroMemory(&data, sizeof(data));
+        data.cbSize = sizeof(data);
+
+        for (DWORD index = 0; SetupDiEnumDeviceInfo(deviceInfo, index, &data); index++) {
+            char instanceBuffer[512] = { 0 };
+            DWORD needed = 0;
+            std::string instanceId;
+            if (SetupDiGetDeviceInstanceIdA(deviceInfo, &data, instanceBuffer, sizeof(instanceBuffer), &needed)) {
+                instanceId = instanceBuffer;
+            }
+
+            std::string adapterGuid;
+            HKEY driverKey = SetupDiOpenDevRegKey(deviceInfo, &data, DIREG_DRV, 0, DIREG_READ, KEY_READ);
+            if (driverKey != NULL && driverKey != INVALID_HANDLE_VALUE) {
+                char guidBuffer[128] = { 0 };
+                DWORD size = sizeof(guidBuffer);
+                DWORD type = 0;
+                if (RegQueryValueExA(driverKey, "NetCfgInstanceId", NULL, &type,
+                    reinterpret_cast<LPBYTE>(guidBuffer), &size) == ERROR_SUCCESS &&
+                    (type == REG_SZ || type == REG_EXPAND_SZ)) {
+                    adapterGuid = guidBuffer;
+                }
+                RegCloseKey(driverKey);
+            }
+
+            if (!adapterGuid.empty() && !instanceId.empty()) {
+                out[toLowerCopy(adapterGuid)] = instanceId;
+            }
+        }
+        SetupDiDestroyDeviceInfoList(deviceInfo);
+    }
+
+    // The undo script (Undo-CL-Setup.ps1) uses this list to re-detect removed adapters
+    void appendRemovedAdapterLog(const std::string& instanceId, const std::string& name)
+    {
+        char basePath[MAX_PATH] = { 0 };
+        if (GetEnvironmentVariableA("LOCALAPPDATA", basePath, MAX_PATH) == 0) return;
+        std::string directory = std::string(basePath) + "\\CL-Setup";
+        CreateDirectoryA(directory.c_str(), NULL);
+        std::ofstream log(directory + "\\removed-adapters.log", std::ios::app);
+        if (log.is_open()) {
+            log << instanceId << "|" << name << "\n";
+        }
+    }
+
+    struct SmbiosIdentity {
+        bool valid = false;
+        int smbiosMajor = 0;
+        int smbiosMinor = 0;
+        std::string systemManufacturer;
+        std::string systemProduct;
+        std::string systemVersion;
+        std::string systemSerial;
+        std::string boardManufacturer;
+        std::string boardProduct;
+        std::string boardVersion;
+        std::string boardSerial;
+        std::string uuidText;
+        bool uuidNil = false;
+    };
+
+    std::string formatSmbiosUuid(const BYTE* bytes)
+    {
+        char text[64] = { 0 };
+        snprintf(text, sizeof(text),
+            "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]);
+        return text;
+    }
+
+    // Raw SMBIOS (GetSystemFirmwareTable) - the layer perm HWID spoofers patch
+    SmbiosIdentity readSmbiosIdentity()
+    {
+        SmbiosIdentity identity;
+
+        UINT bufferSize = GetSystemFirmwareTable(0x52534D42 /* 'RSMB' */, 0, NULL, 0);
+        if (bufferSize == 0 || bufferSize > 8 * 1024 * 1024) return identity;
+
+        std::vector<BYTE> buffer(bufferSize);
+        UINT bytesRead = GetSystemFirmwareTable(0x52534D42, 0, buffer.data(), bufferSize);
+        if (bytesRead == 0) return identity;
+
+#pragma pack(push, 1)
+        struct RawSmbiosData {
+            BYTE Used20CallingMethod;
+            BYTE SMBIOSMajorVersion;
+            BYTE SMBIOSMinorVersion;
+            BYTE DmiRevision;
+            DWORD Length;
+            BYTE SMBIOSTableData[1];
+        };
+#pragma pack(pop)
+
+        const size_t headerSize = offsetof(RawSmbiosData, SMBIOSTableData);
+        if (bytesRead < headerSize) return identity;
+
+        const RawSmbiosData* raw = reinterpret_cast<const RawSmbiosData*>(buffer.data());
+        identity.smbiosMajor = raw->SMBIOSMajorVersion;
+        identity.smbiosMinor = raw->SMBIOSMinorVersion;
+        DWORD tableLength = raw->Length;
+        DWORD available = bytesRead - static_cast<DWORD>(headerSize);
+        if (tableLength > available) tableLength = available;
+
+        const BYTE* table = raw->SMBIOSTableData;
+        DWORD offset = 0;
+        while (offset + 4 <= tableLength) {
+            const BYTE* header = table + offset;
+            BYTE type = header[0];
+            BYTE formattedLength = header[1];
+            if (formattedLength < 4 || offset + formattedLength > tableLength) break;
+
+            std::vector<std::string> strings;
+            DWORD position = offset + formattedLength;
+            while (position < tableLength && table[position] != 0) {
+                DWORD start = position;
+                while (position < tableLength && table[position] != 0) position++;
+                strings.emplace_back(reinterpret_cast<const char*>(table + start), position - start);
+                position++;
+            }
+            position++; // string-set terminator
+
+            auto getString = [&](int index) -> std::string {
+                if (index < 0 || index >= static_cast<int>(strings.size())) return "";
+                return strings[index];
+            };
+
+            if (type == 1 && formattedLength >= 0x18) {
+                identity.valid = true;
+                identity.systemManufacturer = getString(0);
+                identity.systemProduct = getString(1);
+                identity.systemVersion = getString(2);
+                identity.systemSerial = getString(3);
+
+                const BYTE* uuid = header + 8;
+                bool allZero = true;
+                bool allFF = true;
+                for (int i = 0; i < 16; i++) {
+                    if (uuid[i] != 0x00) allZero = false;
+                    if (uuid[i] != 0xFF) allFF = false;
+                }
+                identity.uuidNil = allZero || allFF;
+                identity.uuidText = formatSmbiosUuid(uuid);
+            }
+            else if (type == 2 && formattedLength >= 8) {
+                identity.boardManufacturer = getString(0);
+                identity.boardProduct = getString(1);
+                identity.boardVersion = getString(2);
+                identity.boardSerial = getString(3);
+            }
+            else if (type == 127) {
+                break;
+            }
+
+            offset = position;
+        }
+        return identity;
+    }
+
+    bool isPlaceholderIdentity(const std::string& value)
+    {
+        std::string lowered = toLowerCopy(trimCopy(value));
+        if (lowered.empty()) return true;
+        static const char* placeholders[] = {
+            "to be filled by o.e.m.", "to be filled by o.e.m", "default string",
+            "system product name", "system manufacturer", "system version",
+            "not specified", "not applicable", "none", "n/a", "oem", "unknown",
+            "base board version", "chassis version", "invalid", "sernum", "xxxx"
+        };
+        for (const char* placeholder : placeholders) {
+            if (lowered == placeholder) return true;
+        }
+        return false;
+    }
+
+    bool isAllHexValue(const std::string& value)
+    {
+        if (value.size() < 8) return false;
+        for (char c : value) {
+            bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!hex) return false;
+        }
+        return true;
+    }
+
+    // "BCF1D5C8102B6C3", "AT5LMDB1M": no spaces, letters + digits, high entropy
+    bool isRandomToken(const std::string& value)
+    {
+        if (value.size() < 8 || value.find(' ') != std::string::npos) return false;
+        bool hasAlpha = false;
+        bool hasDigit = false;
+        bool seen[256] = { false };
+        int unique = 0;
+        for (unsigned char c : value) {
+            if (!seen[c]) { seen[c] = true; unique++; }
+            if (c >= '0' && c <= '9') hasDigit = true;
+            else if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) hasAlpha = true;
+        }
+        if (!hasAlpha || !hasDigit) return false;
+        return static_cast<double>(unique) / static_cast<double>(value.size()) >= 0.6;
+    }
+
+    // "6429-BM-11135", "10116-BV-11344": digits + dashes + short code
+    bool isSyntheticPattern(const std::string& value)
+    {
+        if (value.size() < 10) return false;
+        int dashes = 0;
+        int digitRun = 0;
+        bool longDigitRun = false;
+        for (char c : value) {
+            if (c == '-') { dashes++; digitRun = 0; }
+            else if (c >= '0' && c <= '9') { digitRun++; if (digitRun >= 4) longDigitRun = true; }
+            else if ((c >= 'A' && c <= 'Z') || c == ' ') { digitRun = 0; }
+            else { return false; }
+        }
+        return dashes >= 2 && longDigitRun;
+    }
+
+    // v1.2.1: 0 = clean, 1 = weak anomaly, 2 = strong (hex/synthetic) pattern;
+    // strong is counted separately because two independent strong hits confirm spoofing
+    int identityScore(const std::string& value, bool* wasStrong)
+    {
+        if (wasStrong) *wasStrong = false;
+        std::string cleaned = trimCopy(value);
+        if (cleaned.empty()) return 0;
+        if (isAllHexValue(cleaned) || isSyntheticPattern(cleaned)) {
+            if (wasStrong) *wasStrong = true;
+            return 2;
+        }
+        if (isRandomToken(cleaned)) return 1;
+        if (isPlaceholderIdentity(cleaned)) return 1;
+        return 0;
+    }
+
+    bool identityDiffers(const std::string& smbios, const std::string& registryValue)
+    {
+        if (smbios.empty() || registryValue.empty()) return false;
+        return toLowerCopy(trimCopy(smbios)) != toLowerCopy(trimCopy(registryValue));
+    }
+
+    // v1.2.1: "v1.2.3" / "1.2.3-beta" -> {1,2,3}; false if not version-like
+    bool parseVersionParts(const std::string& input, std::vector<int>& out)
+    {
+        std::string s = trimCopy(input);
+        if (!s.empty() && (s[0] == 'v' || s[0] == 'V')) s = s.substr(1);
+        size_t cut = s.find_first_of("-+");
+        if (cut != std::string::npos) s = s.substr(0, cut);
+        if (s.empty()) return false;
+
+        out.clear();
+        std::stringstream ss(s);
+        std::string part;
+        while (std::getline(ss, part, '.')) {
+            if (part.empty()) return false;
+            for (char c : part) {
+                if (c < '0' || c > '9') return false;
+            }
+            out.push_back(atoi(part.c_str()));
+        }
+        return out.size() >= 2;
+    }
+
+    bool looksLikeVersion(const std::string& input)
+    {
+        std::vector<int> parts;
+        return parseVersionParts(input, parts);
+    }
+
+    // true only when the remote tag is actually NEWER than the local version
+    bool isNewerVersion(const std::string& remote, const std::string& local)
+    {
+        std::vector<int> r;
+        std::vector<int> l;
+        if (!parseVersionParts(remote, r) || !parseVersionParts(local, l)) return false;
+        size_t n = (std::max)(r.size(), l.size());
+        r.resize(n, 0);
+        l.resize(n, 0);
+        return r > l;
+    }
 }
 
 void Helper::recordResult(const std::string& check, const std::string& status, const std::string& message)
@@ -74,6 +438,17 @@ void Helper::printPendingChanges()
     }
 }
 
+// v1.2.1: shop info box shown right after the apply-changes yes/no dialog
+void Helper::showShopInfo()
+{
+    if (cliConfig.headless) return;
+    MessageBoxA(NULL,
+        "You can buy alt accounts for cheap from shop.uchiha.us\n"
+        "You can buy CL from Main shop at: cheatloverz.store",
+        "CL Setup",
+        MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
+}
+
 bool Helper::promptApplyChanges()
 {
     if (!hasPendingChanges()) return false;
@@ -96,6 +471,10 @@ bool Helper::promptApplyChanges()
     int choice = MessageBoxA(NULL, msg.c_str(),
         "Apply setup changes?",
         MB_YESNO | MB_ICONQUESTION | MB_TOPMOST);
+
+    // v1.2.1: promo info box appears right after the yes/no answer
+    showShopInfo();
+
     if (choice == IDYES) return true;
     if (choice == IDNO) return false;
 
@@ -235,8 +614,8 @@ void Helper::showHelp()
     std::cout << "  --quiet             Only show errors and warnings\n";
     std::cout << "  --apply             Apply needed changes without prompting\n";
     std::cout << "  --export FILE       Export results as JSON to FILE\n";
-    std::cout << "  --skip N[,M,...]    Skip specific checks by number (1-25)\n";
-    std::cout << "  --only N[,M,...]    Run only specific checks by number (1-25)\n\n";
+    std::cout << "  --skip N[,M,...]    Skip specific checks by number (1-27)\n";
+    std::cout << "  --only N[,M,...]    Run only specific checks by number (1-27)\n\n";
     std::cout << "Check Numbers:\n";
     std::cout << "  1=WindowsDefender 2=3rdPartyAV 3=SecureBoot 4=RiotVanguard\n";
     std::cout << "  5=VCRedist 6=Chrome 7=ChromeProtection 8=TimeSync 9=Winver\n";
@@ -244,6 +623,7 @@ void Helper::showHelp()
     std::cout << "  14=GameBar 15=TPM 16=CoreIsolation 17=DMAProtection 18=ModifiedOS\n";
     std::cout << "  19=Internet 20=NetworkAdapters 21=VM-Detect 22=Auto-Update\n";
     std::cout << "  23=SecurityMitigations 24=UAC 25=WindowsUpdate\n";
+    std::cout << "  26=CPU-V 27=HWID-Spoofer\n";
 }
 
 CLIConfig Helper::parseCLI(int argc, char* argv[])
@@ -383,6 +763,18 @@ std::string Helper::runSystemCommandWithOutput(const char* command, DWORD timeou
 
 void Helper::backupRegistryKey(HKEY hKeyParent, const std::string& subkey)
 {
+    // Export every key only once per run: the first call always happens before the
+    // key is modified, later calls would already capture changed data.
+    // Undo-CL-Setup.ps1 imports the recorded backup file (or, as a fallback, the
+    // OLDEST matching .reg file in C:\Windows\Temp - the one closest to the
+    // pre-change state) to revert the change.
+    static std::mutex backupMutex;
+    static std::vector<std::string> backedUpKeys;
+    {
+        std::lock_guard<std::mutex> lock(backupMutex);
+        if (std::find(backedUpKeys.begin(), backedUpKeys.end(), subkey) != backedUpKeys.end()) return;
+    }
+
     HKEY hKey;
     if (RegOpenKeyEx(hKeyParent, subkey.c_str(), 0, KEY_READ, &hKey) != ERROR_SUCCESS) return;
 
@@ -402,9 +794,37 @@ void Helper::backupRegistryKey(HKEY hKeyParent, const std::string& subkey)
     std::string keyName = subkey;
     std::replace(keyName.begin(), keyName.end(), '\\', '_');
     std::string exportPath = "C:\\Windows\\Temp\\" + keyName + "_" + timestamp + ".reg";
-    std::string cmd = "reg export \"" + subkey + "\" \"" + exportPath + "\" /y 2>nul";
+    // reg export needs the full hive path (HKLM\...), RegOpenKeyEx above does not
+    std::string hivePrefix = (hKeyParent == HKEY_LOCAL_MACHINE) ? "HKLM\\" :
+        (hKeyParent == HKEY_CURRENT_USER) ? "HKCU\\" :
+        (hKeyParent == HKEY_CLASSES_ROOT) ? "HKCR\\" :
+        (hKeyParent == HKEY_USERS) ? "HKU\\" : "";
+    std::string cmd = "reg export \"" + hivePrefix + subkey + "\" \"" + exportPath + "\" /y 2>nul";
     runSystemCommand(cmd.c_str());
     RegCloseKey(hKey);
+
+    // Undo-CL-Setup.ps1 restores the backup that was taken before the first
+    // reg: marker for this key (last backup: entry preceding it in the log)
+    if (std::filesystem::exists(exportPath)) {
+        logAppliedChange("backup:" + subkey + "|" + exportPath);
+    }
+
+    std::lock_guard<std::mutex> lock(backupMutex);
+    backedUpKeys.push_back(subkey);
+}
+
+void Helper::logAppliedChange(const std::string& change)
+{
+    // Undo-CL-Setup.ps1 reverts only the entries recorded here, so every
+    // non-reversible-looking action (bcdedit, DISM, services, adapters) logs itself
+    char basePath[MAX_PATH] = { 0 };
+    if (GetEnvironmentVariableA("LOCALAPPDATA", basePath, MAX_PATH) == 0) return;
+    std::string directory = std::string(basePath) + "\\CL-Setup";
+    CreateDirectoryA(directory.c_str(), NULL);
+    std::ofstream log(directory + "\\applied-changes.log", std::ios::app);
+    if (log.is_open()) {
+        log << change << "\n";
+    }
 }
 
 ServiceStatus Helper::getServiceStatus(LPCSTR serviceName)
@@ -453,6 +873,7 @@ void Checks::checkInternet()
     Helper::printConcern("- No internet detected, attempting fixes...");
     Helper::runSystemCommand("ipconfig /flushdns");
     Helper::runSystemCommand("netsh winsock reset");
+    Helper::logAppliedChange("info:network was repaired (DNS flush + Winsock reset) - a reboot may be required; the Winsock catalog was reset to Windows defaults");
     Sleep(1000);
 
     if (testPing()) {
@@ -524,6 +945,7 @@ void Checks::checkNetworkAdapters()
     int total = 0;
     int used = 0;
     std::string summary;
+    std::vector<std::pair<std::string, std::string>> unusedVirtual; // {friendly name, adapter GUID}
 
     for (PIP_ADAPTER_ADDRESSES adapter = adapters; adapter != NULL; adapter = adapter->Next) {
         total++;
@@ -541,6 +963,10 @@ void Checks::checkNetworkAdapters()
         bool isLoopback = adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK;
         bool isUsed = adapter->OperStatus == IfOperStatusUp && !isLoopback && (hasAddress || hasGateway);
         if (isUsed) used++;
+        else if (!isLoopback && isVirtualAdapter(name, adapter)) {
+            unusedVirtual.push_back({ name,
+                adapter->AdapterName != NULL ? std::string(adapter->AdapterName) : std::string() });
+        }
 
         std::string line = name + " - " + (isUsed ? "USED" : "NOT USED") +
             " (" + statusToString(adapter->OperStatus) + ")";
@@ -563,8 +989,53 @@ void Checks::checkNetworkAdapters()
         return;
     }
 
-    Helper::recordResult("Network Adapters", "OK",
-        std::to_string(used) + "/" + std::to_string(total) + " used: " + summary);
+    std::string usage = std::to_string(used) + "/" + std::to_string(total) + " used: " + summary;
+
+    // v1.2.1: remove unused virtual adapters (Hyper-V/VMware/VPN/Bluetooth leftovers...)
+    if (unusedVirtual.empty()) {
+        Helper::recordResult("Network Adapters", "OK", usage);
+        return;
+    }
+
+    std::string names;
+    for (const auto& entry : unusedVirtual) {
+        if (!names.empty()) names += ", ";
+        names += entry.first;
+    }
+
+    if (!Helper::requestChange("Uninstall unused virtual network adapter(s): " + names)) {
+        Helper::recordResult("Network Adapters", "WARN",
+            usage + "; not removed yet: " + names);
+        return;
+    }
+
+    std::map<std::string, std::string> deviceInstances;
+    collectNetAdapterInstances(deviceInstances);
+
+    int removed = 0;
+    for (const auto& entry : unusedVirtual) {
+        auto device = deviceInstances.find(toLowerCopy(entry.second));
+        if (entry.second.empty() || device == deviceInstances.end()) {
+            Helper::printInfo("No device instance found for adapter: " + entry.first);
+            continue;
+        }
+
+        std::string command = "pnputil /remove-device \"" + device->second + "\"";
+        int exitCode = Helper::runSystemCommandExitCode(command.c_str());
+        if (exitCode == 0) {
+            Helper::printSuccess("- Removed unused virtual adapter: " + entry.first, true);
+            appendRemovedAdapterLog(device->second, entry.first);
+            removed++;
+        }
+        else {
+            Helper::printError("- Could not remove adapter " + entry.first +
+                " (pnputil exit " + std::to_string(exitCode) + ")");
+        }
+    }
+
+    Helper::recordResult("Network Adapters", removed > 0 ? "OK" : "WARN",
+        usage + "; removed " + std::to_string(removed) + "/" +
+        std::to_string(unusedVirtual.size()) + " unused virtual adapter(s): " + names);
 }
 
 void Checks::checkSecurityMitigations()
@@ -625,6 +1096,7 @@ void Checks::checkSecurityMitigations()
         std::string previous = hasValue ? std::to_string(currentValue) : "missing";
         Helper::printSuccess("- Set " + std::string(label) + " from " + previous + " to " + std::to_string(desiredValue), true);
         appendSummary(std::string(label) + "=" + previous + "->" + std::to_string(desiredValue));
+        Helper::logAppliedChange("reg:" + std::string(subkey));
         changed = true;
         return true;
     };
@@ -698,6 +1170,7 @@ void Checks::checkSecurityMitigations()
             return;
         }
         Helper::runSystemCommand("bcdedit /set hypervisorlaunchtype off");
+        Helper::logAppliedChange("bcdedit:hypervisorlaunchtype=off");
         Helper::printSuccess("- Set hypervisor launch type to off", true);
         appendSummary("hypervisorlaunchtype=changed to off");
         changed = true;
@@ -748,6 +1221,7 @@ void Checks::checkSecurityMitigations()
         std::string disableCommand = "dism /online /disable-feature /featurename:" + featureName + " /norestart";
         Helper::runSystemCommand(disableCommand.c_str());
         Helper::printSuccess("- Disabled Windows feature: " + featureName, true);
+        Helper::logAppliedChange("dism:" + featureName);
         appendSummary(featureName + "=changed to disabled");
         changed = true;
     };
@@ -842,7 +1316,9 @@ void Checks::checkForUpdate()
             std::getline(file, storedRepo);
             std::string tag;
             if (std::getline(file, tag)) {
-                if (storedRepo == expectedRepo && !tag.empty()) {
+                tag = trimCopy(tag);
+                // v1.2.1: ignore poisoned/stale cache entries that are not version-like
+                if (storedRepo == expectedRepo && looksLikeVersion(tag)) {
                     return tag;
                 }
             }
@@ -887,7 +1363,9 @@ void Checks::checkForUpdate()
                 }
             }
 
-            if (tag.empty()) {
+            // v1.2.1: only accept real version tags (the API also returns
+            // non-version tags, and garbage must never trigger the dialog)
+            if (!looksLikeVersion(tag)) {
                 Helper::printConcern("- Could not parse update info");
                 Helper::recordResult("Auto-Update", "WARN", "Could not parse release info");
                 return;
@@ -896,7 +1374,9 @@ void Checks::checkForUpdate()
         }
     }
 
-    if (tag != "v" + Helper::g_appVersion && tag != Helper::g_appVersion) {
+    // v1.2.1: only warn when the remote tag is actually newer - equal or
+    // older tags (dev builds, re-releases) must not show the dialog
+    if (isNewerVersion(tag, Helper::g_appVersion)) {
         Helper::printConcern("- New version available: " + tag + " (current: v" + Helper::g_appVersion + ")");
         if (!Helper::cliConfig.headless) {
             MessageBoxA(GetConsoleWindow(),
@@ -964,6 +1444,8 @@ bool Checks::checkAVTamperProtection(const std::string& avName)
 void Checks::checkWindowsDefender()
 {
     SetConsoleTitleA("Checking Windows Defender");
+
+    Helper::backupRegistryKey(HKEY_LOCAL_MACHINE, "SOFTWARE\\Policies\\Microsoft\\Windows Defender");
 
     if (checkDefenderTamperProtection()) {
         return;
@@ -1049,6 +1531,10 @@ void Checks::checkWindowsDefender()
     RegSetValueEx(hKey, "DisableScanOnRealtimeEnable", 0, REG_DWORD, (BYTE*)&val, sizeof(val));
     RegCloseKey(hKey);
 
+    // Undo-CL-Setup.ps1 re-enables the service from this marker
+    Helper::logAppliedChange("service:WinDefend=disabled");
+    Helper::logAppliedChange("reg:SOFTWARE\\Policies\\Microsoft\\Windows Defender");
+
     if (serviceStopped) {
         Helper::printSuccess("- Windows Defender disabled (service + policy)", true);
         Helper::recordResult("Windows Defender", "OK", "Disabled (changed)");
@@ -1069,47 +1555,93 @@ void Checks::check3rdPartyAntiVirus()
     Helper::backupRegistryKey(HKEY_LOCAL_MACHINE,
         "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall");
 
-    auto runWMIC = [](const std::string& cmd) -> std::string {
-        std::string fullCmd = cmd + " 2>nul";
-        std::FILE* pipe = _popen(fullCmd.c_str(), "r");
-        if (!pipe) {
-            if (!Helper::requestChange("Enable WMIC optional feature for antivirus detection")) {
-                return std::string("ERROR");
-            }
-            Helper::runSystemCommand("dism /online /enable-feature /featurename:WMIC /quiet /norestart 2>nul");
-            Sleep(500);
-            pipe = _popen(fullCmd.c_str(), "r");
-        }
-        if (!pipe) return "ERROR";
-        char buffer[256]; std::string result;
-        while (std::fgets(buffer, 256, pipe)) result += buffer;
-        _pclose(pipe);
-        return result;
-    };
-
-    std::string wmiOutput = runWMIC("WMIC /Node:localhost /Namespace:\\\\root\\SecurityCenter2 Path AntiVirusProduct Get displayName /Format:List");
-    if (wmiOutput == "ERROR") {
-        Helper::printConcern("- WMIC not available - possible modified OS");
-        Helper::recordResult("3rd Party AV", "WARN", "WMIC not available");
-        return;
-    }
+    // v1.2.1: WMIC is removed by default on newer Windows 11 builds,
+    // so query SecurityCenter2 through PowerShell/CIM instead (the same source
+    // WMIC used). The marker tells us whether PowerShell actually ran.
+    std::string psCommand =
+        "powershell -NoProfile -NonInteractive -Command \""
+        "(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct).displayName; 'CL-AV-DONE'"
+        "\" 2>nul";
+    std::string avOutput = Helper::runSystemCommandWithOutput(psCommand.c_str(), 30000);
+    if (avOutput == "TIMEOUT") avOutput.clear();
+    bool psWorked = avOutput.find("CL-AV-DONE") != std::string::npos;
 
     std::string antivirusList;
-    while (wmiOutput.find("\n") != std::string::npos) {
-        std::string av = wmiOutput.substr(0, wmiOutput.find("\n"));
-        if (av.find("Windows Defender") == std::string::npos && av.size() > 12) {
-            av = av.substr(12);
-            av.erase(std::remove(av.begin(), av.end(), '\n'), av.end());
-            av.erase(std::remove(av.begin(), av.end(), '\r'), av.end());
-            av.erase(std::remove(av.begin(), av.end(), '\b'), av.end());
-            if (!av.empty()) {
-                if (!antivirusList.empty()) antivirusList += ", ";
-                antivirusList += av;
+    if (psWorked) {
+        std::stringstream avStream(avOutput);
+        std::string line;
+        while (std::getline(avStream, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            const std::string wmicPrefix = "displayName="; // tolerate old WMIC-style output
+            if (line.rfind(wmicPrefix, 0) == 0) line = line.substr(wmicPrefix.size());
+            line = trimCopy(line);
+            if (line.empty() || line == "CL-AV-DONE") continue;
+
+            std::string lowered = line;
+            std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (lowered.find("windows defender") != std::string::npos) continue;
+            if (antivirusList.find(line) != std::string::npos) continue;
+
+            if (!antivirusList.empty()) antivirusList += ", ";
+            antivirusList += line;
+        }
+    }
+    else {
+        // Fallback without PowerShell/CIM: known AV products in the uninstall registry
+        static const char* knownAv[] = {
+            "norton", "mcafee", "kaspersky", "bitdefender", "eset", "avg", "avast",
+            "avira", "sophos", "trend micro", "f-secure", "malwarebytes", "g data",
+            "zonealarm", "comodo", "bullguard", "secureanywhere", "webroot"
+        };
+        HKEY roots[] = { HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER };
+        const char* uninstallPaths[] = {
+            "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+            "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall"
+        };
+
+        for (HKEY root : roots) {
+            for (const char* uninstallPath : uninstallPaths) {
+                HKEY hKey;
+                if (RegOpenKeyEx(root, uninstallPath, 0, KEY_READ, &hKey) != ERROR_SUCCESS) continue;
+
+                DWORD idx = 0;
+                char subkeyName[256];
+                DWORD subkeyNameSize = sizeof(subkeyName);
+                while (RegEnumKeyEx(hKey, idx, subkeyName, &subkeyNameSize, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+                    HKEY hSubkey;
+                    if (RegOpenKeyEx(hKey, subkeyName, 0, KEY_READ, &hSubkey) == ERROR_SUCCESS) {
+                        char dn[256] = "";
+                        DWORD dnSize = sizeof(dn);
+                        if (RegQueryValueEx(hSubkey, "DisplayName", NULL, NULL, (LPBYTE)dn, &dnSize) == ERROR_SUCCESS) {
+                            std::string display = trimCopy(dn);
+                            std::string lowered = display;
+                            std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                            for (const char* marker : knownAv) {
+                                if (lowered.find(marker) != std::string::npos) {
+                                    if (antivirusList.find(display) == std::string::npos) {
+                                        if (!antivirusList.empty()) antivirusList += ", ";
+                                        antivirusList += display;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        RegCloseKey(hSubkey);
+                    }
+                    subkeyNameSize = sizeof(subkeyName);
+                    ++idx;
+                }
+                RegCloseKey(hKey);
             }
         }
-        size_t pos = wmiOutput.find("\n");
-        if (pos + 1 < wmiOutput.size()) wmiOutput = wmiOutput.substr(pos + 1);
-        else break;
+
+        if (antivirusList.empty()) {
+            Helper::printConcern("- Could not query antivirus products (PowerShell blocked, no known AV in registry)");
+            Helper::recordResult("3rd Party AV", "WARN", "AV detection unavailable");
+            return;
+        }
     }
 
     if (!antivirusList.empty()) {
@@ -1176,6 +1708,8 @@ void Checks::check3rdPartyAntiVirus()
 
         if (anyRemoved) {
             Helper::printSuccess("- Attempted to remove 3rd party AV (" + antivirusList + ")", true);
+            Helper::logAppliedChange("info:3rd party AV uninstall was attempted (" + antivirusList +
+                ") - reinstall it manually if it is still needed");
             Helper::recordResult("3rd Party AV", "OK", "Uninstall attempted: " + antivirusList);
         } else {
             Helper::printError("- 3rd party Anti-Virus detected: " + antivirusList);
@@ -1232,6 +1766,7 @@ void Checks::uninstallRiotVanguard()
                     ? "C:\\Program Files\\Riot Vanguard\\installer.exe"
                     : "C:\\Program Files (x86)\\Riot Vanguard\\installer.exe";
                 _spawnl(_P_WAIT, vgPath, "installer.exe", NULL);
+                Helper::logAppliedChange("info:Riot Vanguard uninstall was started - reinstall it manually if it is still needed");
                 Helper::printError("- Riot Vanguard needs to be uninstalled");
                 Helper::recordResult("Riot Vanguard", "FAIL", "Installed - prompted uninstall");
                 return;
@@ -1299,6 +1834,7 @@ void Checks::installVCRedist()
     SetConsoleTitleA("Installing VCRedist");
     Helper::runSystemCommand("C:\\Windows\\VC_redist.x64.exe /install /q /norestart");
     Helper::runSystemCommand("C:\\Windows\\VC_redist.x86.exe /install /q /norestart");
+    Helper::logAppliedChange("info:Microsoft Visual C++ Redistributable was installed - uninstall it via Apps & Features if unwanted");
 
     if (!(std::filesystem::exists("C:\\Windows\\System32\\vcruntime140.dll") ||
           std::filesystem::exists("C:\\Windows\\SysWOW64\\vcruntime140.dll")) ||
@@ -1321,20 +1857,50 @@ void Checks::installVCRedist()
 void Checks::checkSecureBoot()
 {
     SetConsoleTitleA("Checking Secure-Boot");
-    DWORD secbootStatus;
-    Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE,
+
+    // v1.2.1: know the boot mode first - legacy BIOS systems cannot have Secure Boot at all
+    DWORD firmwareType = 0; // 0 = unknown, 1 = BIOS, 2 = UEFI
+    HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+    if (kernel32 != NULL) {
+        typedef BOOL(WINAPI* GetFirmwareTypeFn)(DWORD*);
+        GetFirmwareTypeFn getFirmwareType =
+            reinterpret_cast<GetFirmwareTypeFn>(GetProcAddress(kernel32, "GetFirmwareType"));
+        if (getFirmwareType != NULL) getFirmwareType(&firmwareType);
+    }
+
+    if (firmwareType == 1) {
+        Helper::printSuccess("- Secure-Boot is not available (legacy BIOS boot)", false);
+        Helper::recordResult("Secure Boot", "OK", "Legacy BIOS - not available");
+        return;
+    }
+
+    DWORD secbootStatus = 0;
+    bool stateRead = Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE,
         "SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State", "UEFISecureBootEnabled", &secbootStatus);
 
+    if (!stateRead) {
+        if (firmwareType == 2) {
+            Helper::printConcern("- UEFI boot detected but the Secure-Boot state could not be read");
+            Helper::recordResult("Secure Boot", "WARN", "UEFI - state unreadable");
+        }
+        else {
+            Helper::printError("- Unable to check Secure-Boot Status (Error 12)");
+            Helper::recordResult("Secure Boot", "FAIL", "Unknown state");
+        }
+        return;
+    }
+
     if (secbootStatus == 0x00000000) {
-        Helper::printSuccess("- Secure-Boot is disabled", false);
-        Helper::recordResult("Secure Boot", "OK", "Disabled");
+        Helper::printSuccess("- Secure-Boot is disabled (UEFI)", false);
+        Helper::recordResult("Secure Boot", "OK", "Disabled (UEFI)");
     }
     else if (secbootStatus == 0x00000001) {
         Helper::printError("- Secure-Boot is enabled, please disable Secure-Boot in your BIOS");
         Helper::recordResult("Secure Boot", "FAIL", "Enabled");
     }
     else {
-        Helper::printError("- Unable to check Secure-Boot Status (Error 12)");
+        Helper::printError("- Unable to check Secure-Boot Status (Error 12, state=" +
+            std::to_string(secbootStatus) + ")");
         Helper::recordResult("Secure Boot", "FAIL", "Unknown state");
     }
 }
@@ -1430,6 +1996,10 @@ void Checks::syncWindowsTime()
             CloseServiceHandle(serviceHandle); CloseServiceHandle(scmHandle);
             return;
         }
+        // only when the start type really changed: Undo-CL-Setup.ps1 sets it back to demand
+        if (serviceConfig->dwStartType != SERVICE_AUTO_START) {
+            Helper::logAppliedChange("service:W32Time=auto");
+        }
         if (StartService(serviceHandle, 0, NULL) == FALSE) {
             Helper::printError("- Failed to sync Windows Time (Error 19)");
             CloseServiceHandle(serviceHandle); CloseServiceHandle(scmHandle);
@@ -1457,6 +2027,8 @@ void Checks::disableChromeProtection()
         return;
     }
 
+    Helper::backupRegistryKey(HKEY_LOCAL_MACHINE, "SOFTWARE\\Policies\\Google\\Chrome");
+
     DWORD status;
     if (Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE, "SOFTWARE\\Policies\\Google\\Chrome",
         "SafeBrowsingProtectionLevel", &status)) {
@@ -1477,6 +2049,7 @@ void Checks::disableChromeProtection()
         0, NULL, REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hKey, &disp);
     LONG createDWORD = RegSetValueEx(hKey, "SafeBrowsingProtectionLevel", NULL, REG_DWORD, (const BYTE*)&value, sizeof(value));
     RegCloseKey(hKey);
+    Helper::logAppliedChange("reg:SOFTWARE\\Policies\\Google\\Chrome");
 
     if (createKey == ERROR_SUCCESS && createDWORD == ERROR_SUCCESS) {
         Helper::printSuccess("- Successfully disabled Chrome protection", true);
@@ -1519,21 +2092,26 @@ void Checks::checkWinver()
         {16299, "Win10 1709"}, {17134, "Win10 1803"}, {17763, "Win10 1809"}, {18362, "Win10 1903"},
         {19041, "Win10 2004"}, {19042, "Win10 20H2"}, {19043, "Win10 21H1"}, {19044, "Win10 21H2"},
         {19045, "Win10 22H2"}, {22000, "Win11 21H2"}, {22621, "Win11 22H2"}, {22631, "Win11 23H2"},
-        {26100, "Win11 24H2"},
+        {26100, "Win11 24H2"}, {26200, "Win11 25H2"},
     };
     int min_build = 19041;
     std::vector<int> trouble = {19045, 22621};
 
+    // 25H2 and every build we do not know yet are 50/50: works for some users, breaks for others
+    const int fiftyFiftyFrom = 26200;
+
     auto it = build_map.find(build);
     if (it != build_map.end()) { winver = it->second; }
+    else if (build >= fiftyFiftyFrom) { winver = "Build " + std::to_string(build); }
 
     if (build < min_build) {
         Helper::printError("- Winver \"" + winver + "\" is unsupported, please upgrade");
         Helper::recordResult("Winver", "FAIL", "Unsupported: " + winver + " (Build " + std::to_string(build) + ")");
     }
-    else if (std::find(trouble.begin(), trouble.end(), build) != trouble.end()) {
-        Helper::printConcern("- Winver \"" + winver + "\" is a 50/50, if issues occur contact support");
-        Helper::recordResult("Winver", "WARN", "Troublesome: " + winver);
+    else if (build >= fiftyFiftyFrom ||
+        std::find(trouble.begin(), trouble.end(), build) != trouble.end()) {
+        Helper::printConcern("- Winver \"" + winver + "\" is a 50/50, if error contact support");
+        Helper::recordResult("Winver", "WARN", winver + " is a 50/50, if error contact support");
     }
     else {
         Helper::printSuccess("- Winver is supported (" + winver + ")", false);
@@ -1558,6 +2136,7 @@ void Checks::deleteSymbols()
             return;
         }
         Helper::printSuccess("- Successfully deleted " + path, true);
+        Helper::logAppliedChange("info:C:\\Symbols was deleted and cannot be restored automatically");
         Helper::recordResult("Symbols", "OK", "Deleted (changed)");
         return;
     }
@@ -1568,6 +2147,8 @@ void Checks::deleteSymbols()
 void Checks::checkFastBoot()
 {
     SetConsoleTitleA("Checking Fast-Boot");
+    Helper::backupRegistryKey(HKEY_LOCAL_MACHINE,
+        "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power");
     DWORD status;
     if (Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE,
         "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power", "HiberbootEnabled", &status)) {
@@ -1587,6 +2168,7 @@ void Checks::checkFastBoot()
         0, NULL, REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hKey, &disp);
     LONG cd = RegSetValueEx(hKey, "HiberbootEnabled", NULL, REG_DWORD, (const BYTE*)&value, sizeof(value));
     RegCloseKey(hKey);
+    Helper::logAppliedChange("reg:SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power");
     if (ck == ERROR_SUCCESS && cd == ERROR_SUCCESS) {
         Helper::printSuccess("- Successfully disabled Fast-Boot", true);
         Helper::restartRequired = true;
@@ -1601,6 +2183,8 @@ void Checks::checkFastBoot()
 void Checks::checkExploitProtection()
 {
     SetConsoleTitleA("Checking Exploit-Protection");
+    Helper::backupRegistryKey(HKEY_LOCAL_MACHINE,
+        "SOFTWARE\\Policies\\Microsoft\\Windows Defender Security Center\\App and Browser protection");
     DWORD status;
     if (Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE,
         "SOFTWARE\\Policies\\Microsoft\\Windows Defender Security Center\\App and Browser protection",
@@ -1622,6 +2206,7 @@ void Checks::checkExploitProtection()
         0, NULL, REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hKey, &disp);
     LONG cd = RegSetValueEx(hKey, "DisallowExploitProtectionOverride", NULL, REG_DWORD, (const BYTE*)&value, sizeof(value));
     RegCloseKey(hKey);
+    Helper::logAppliedChange("reg:SOFTWARE\\Policies\\Microsoft\\Windows Defender Security Center\\App and Browser protection");
     if (ck == ERROR_SUCCESS && cd == ERROR_SUCCESS) {
         Helper::printSuccess("- Successfully disabled Exploit-Protection", true);
         Helper::restartRequired = true;
@@ -1636,6 +2221,7 @@ void Checks::checkExploitProtection()
 void Checks::checkSmartScreen()
 {
     SetConsoleTitleA("Checking SmartScreen");
+    Helper::backupRegistryKey(HKEY_LOCAL_MACHINE, "SOFTWARE\\Policies\\Microsoft\\Windows\\System");
     DWORD status;
     if (Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE,
         "SOFTWARE\\Policies\\Microsoft\\Windows\\System", "EnableSmartScreen", &status)) {
@@ -1655,6 +2241,7 @@ void Checks::checkSmartScreen()
         0, NULL, REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hKey, &disp);
     LONG cd = RegSetValueEx(hKey, "EnableSmartScreen", NULL, REG_DWORD, (const BYTE*)&value, sizeof(value));
     RegCloseKey(hKey);
+    Helper::logAppliedChange("reg:SOFTWARE\\Policies\\Microsoft\\Windows\\System");
     if (ck == ERROR_SUCCESS && cd == ERROR_SUCCESS) {
         Helper::printSuccess("- Successfully disabled SmartScreen", true);
         Helper::restartRequired = true;
@@ -1669,6 +2256,7 @@ void Checks::checkSmartScreen()
 void Checks::checkGameBar()
 {
     SetConsoleTitleA("Checking Xbox Gamebar");
+    Helper::backupRegistryKey(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\GameDVR");
     DWORD status;
     if (Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE,
         "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\GameDVR", "AppCaptureEnabled", &status)) {
@@ -1688,6 +2276,7 @@ void Checks::checkGameBar()
         0, NULL, REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE, NULL, &hKey, &disp);
     LONG cd = RegSetValueEx(hKey, "AppCaptureEnabled", NULL, REG_DWORD, (const BYTE*)&value, sizeof(value));
     RegCloseKey(hKey);
+    Helper::logAppliedChange("reg:SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\GameDVR");
     if (ck == ERROR_SUCCESS && cd == ERROR_SUCCESS) {
         Helper::printSuccess("- Successfully enabled Gamebar", true);
         Helper::restartRequired = true;
@@ -1768,26 +2357,96 @@ void Checks::checkModifiedOS()
 void Checks::checkTPMStatus()
 {
     SetConsoleTitleA("Checking TPM");
-    DWORD tpmActive = 0; bool found = false;
-    HKEY hKey;
-    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\TPM", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        DWORD size = sizeof(DWORD);
-        if (RegQueryValueEx(hKey, "TPMActive", NULL, NULL, (LPBYTE)&tpmActive, &size) == ERROR_SUCCESS) found = true;
-        RegCloseKey(hKey);
+
+    const char* tpmKey = "SYSTEM\\CurrentControlSet\\Control\\TPM";
+
+    // v1.2.1: read every state value Windows exposes instead of the single TPMActive entry
+    DWORD present = 0, enabled = 0, activated = 0, ready = 0, tpmActive = 0;
+    bool presentRead = Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE, tpmKey, "Present", &present);
+    bool enabledRead = Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE, tpmKey, "Enabled", &enabled);
+    bool activatedRead = Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE, tpmKey, "Activated", &activated);
+    bool readyRead = Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE, tpmKey, "Ready", &ready);
+    bool activeRead = Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE, tpmKey, "TPMActive", &tpmActive);
+
+    std::string specVersion = readRegistryStringValue(HKEY_LOCAL_MACHINE, tpmKey, "SpecVersion");
+    std::string manufacturer = readRegistryStringValue(HKEY_LOCAL_MACHINE, tpmKey, "ManufacturerIdTxt");
+
+    std::string detail;
+    if (!specVersion.empty()) detail += " (" + specVersion;
+    if (!manufacturer.empty()) detail += detail.empty() ? " (" + manufacturer : ", " + manufacturer;
+    if (!detail.empty()) detail += ")";
+
+    bool registryUsable = presentRead || enabledRead || activatedRead || readyRead || activeRead;
+    if (registryUsable) {
+        bool tpmPresent = (presentRead && present == 1) || (activeRead && tpmActive == 1);
+        bool tpmRunning = (enabledRead && enabled == 1) ||
+                          (activatedRead && activated == 1) ||
+                          (readyRead && ready == 1);
+
+        if (tpmPresent && tpmRunning) {
+            Helper::printError("- TPM is enabled" + detail + ", please disable TPM in your BIOS");
+            Helper::recordResult("TPM", "FAIL", "Enabled" + detail);
+        }
+        else if (tpmPresent) {
+            Helper::printSuccess("- TPM present but not usable (disabled in BIOS)" + detail, false);
+            Helper::recordResult("TPM", "OK", "Present but not usable" + detail);
+        }
+        else {
+            Helper::printSuccess("- TPM is disabled / not found" + detail, false);
+            Helper::recordResult("TPM", "OK", "Disabled/not found" + detail);
+        }
+        return;
     }
-    if (!found || tpmActive == 0) {
-        Helper::printSuccess("- TPM is disabled / not found", false);
-        Helper::recordResult("TPM", "OK", "Disabled/not found");
+
+    // No registry state: ask the TPM WMI provider (same source as tpm.msc / Get-Tpm)
+    std::string tpmCommand =
+        "powershell -NoProfile -NonInteractive -Command \""
+        "(Get-CimInstance -Namespace root/cimv2/security/microsofttpm -ClassName Win32_Tpm | "
+        "ForEach-Object { $_.SpecVersion + '|' + $_.IsEnabled_InitialValue + '|' + $_.IsActivated_InitialValue })\" 2>nul";
+    std::string output = trimCopy(Helper::runSystemCommandWithOutput(tpmCommand.c_str(), 20000));
+    if (output == "TIMEOUT") output.clear();
+
+    size_t firstSep = output.find('|');
+    if (firstSep == std::string::npos) {
+        Helper::printSuccess("- TPM is disabled / not usable (no TPM reported by Windows)", false);
+        Helper::recordResult("TPM", "OK", "Disabled/not usable");
+        return;
+    }
+
+    size_t secondSep = output.find('|', firstSep + 1);
+    std::string spec = trimCopy(output.substr(0, firstSep));
+    std::string isEnabled = toLowerCopy(trimCopy(output.substr(firstSep + 1,
+        secondSep == std::string::npos ? std::string::npos : secondSep - firstSep - 1)));
+    std::string isActivated = secondSep == std::string::npos ? "" :
+        toLowerCopy(trimCopy(output.substr(secondSep + 1)));
+
+    bool tpmEnabledFlag = (isEnabled == "true");
+    bool tpmActivatedFlag = (isActivated == "true");
+    std::string wmiDetail = spec.empty() ? "" : " (" + spec + ")";
+
+    if (tpmEnabledFlag && tpmActivatedFlag) {
+        Helper::printError("- TPM is enabled" + wmiDetail + ", please disable TPM in your BIOS");
+        Helper::recordResult("TPM", "FAIL", "Enabled" + wmiDetail);
+    }
+    else if (tpmEnabledFlag || tpmActivatedFlag) {
+        Helper::printConcern("- TPM is partially available (Enabled=" + isEnabled +
+            ", Activated=" + isActivated + ")" + wmiDetail);
+        Helper::recordResult("TPM", "WARN", "Partially available" + wmiDetail);
     }
     else {
-        Helper::printError("- TPM is enabled, please disable TPM in BIOS");
-        Helper::recordResult("TPM", "FAIL", "Enabled");
+        Helper::printSuccess("- TPM is disabled / not usable" + wmiDetail, false);
+        Helper::recordResult("TPM", "OK", "Disabled/not usable" + wmiDetail);
     }
 }
 
 void Checks::checkCoreIsolation()
 {
     SetConsoleTitleA("Checking Core Isolation (VBS/HVCI)");
+
+    // Runs before checkSecurityMitigations, so these are the pre-change exports
+    Helper::backupRegistryKey(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard");
+    Helper::backupRegistryKey(HKEY_LOCAL_MACHINE,
+        "SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity");
 
     DWORD hvci = 0;
     bool hvciRead = Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE,
@@ -1817,6 +2476,7 @@ void Checks::checkCoreIsolation()
             0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
             DWORD val = 0;
             if (RegSetValueEx(hKey, "Enabled", 0, REG_DWORD, (BYTE*)&val, sizeof(val)) == ERROR_SUCCESS) {
+                Helper::logAppliedChange("reg:SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity");
                 Helper::printSuccess("- Disabled HVCI", true);
                 Helper::recordResult("Core Isolation", "OK", "HVCI disabled (changed)");
                 changed = true;
@@ -1841,6 +2501,7 @@ void Checks::checkCoreIsolation()
             0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
             DWORD val = 0;
             if (RegSetValueEx(hKey, "EnableVirtualizationBasedSecurity", 0, REG_DWORD, (BYTE*)&val, sizeof(val)) == ERROR_SUCCESS) {
+                Helper::logAppliedChange("reg:SYSTEM\\CurrentControlSet\\Control\\DeviceGuard");
                 if (!changed) Helper::printSuccess("- Disabled VBS", true);
                 Helper::recordResult("Core Isolation", "OK", "VBS disabled (changed)");
                 changed = true;
@@ -1892,8 +2553,23 @@ void Checks::checkDMAProtection()
         }
         return;
     }
-    Helper::printSuccess("- Kernel DMA Protection is not active", false);
-    Helper::recordResult("DMA Protection", "OK", "Not supported");
+
+    // v1.2.1: registry has no state -> ask Win32_DeviceGuard (the source msinfo32 uses)
+    std::string deviceGuardCommand =
+        "powershell -NoProfile -NonInteractive -Command \""
+        "(Get-CimInstance -Namespace root/Microsoft/Windows/DeviceGuard -ClassName Win32_DeviceGuard)"
+        ".AvailableSecurityProperties -join ','\" 2>nul";
+    std::string available = trimCopy(Helper::runSystemCommandWithOutput(deviceGuardCommand.c_str(), 20000));
+    if (available == "TIMEOUT") available.clear();
+
+    if (!available.empty() && csvContains(available, 3)) {
+        Helper::printSuccess("- Kernel DMA Protection is supported by the firmware, currently off", false);
+        Helper::recordResult("DMA Protection", "OK", "Supported, not active (msinfo32: Off)");
+    }
+    else {
+        Helper::printSuccess("- Kernel DMA Protection is not active", false);
+        Helper::recordResult("DMA Protection", "OK", "Not active/not supported");
+    }
 }
 
 void Checks::checkUAC()
@@ -1960,6 +2636,167 @@ void Checks::checkWindowsUpdate()
     CloseServiceHandle(scm);
 }
 
+// v1.2.1: CPUID + firmware-feature based virtualization check (no WMIC dependency)
+void Checks::checkCPUVirtualization()
+{
+    SetConsoleTitleA("Checking CPU Virtualization");
+
+    // CPUID: VT-x (Intel, leaf 1 ECX bit 5) / SVM (AMD, ext leaf 0x80000001 ECX bit 2)
+    int regs[4] = { 0, 0, 0, 0 };
+    bool vmx = false;
+    bool svm = false;
+
+    __cpuid(regs, 0);
+    unsigned maxLeaf = static_cast<unsigned>(regs[0]);
+    if (maxLeaf >= 1) {
+        __cpuid(regs, 1);
+        vmx = (regs[2] & (1 << 5)) != 0;
+    }
+
+    __cpuid(regs, static_cast<int>(0x80000000u));
+    unsigned maxExtLeaf = static_cast<unsigned>(regs[0]);
+    if (maxExtLeaf >= 0x80000001u) {
+        __cpuid(regs, static_cast<int>(0x80000001u));
+        svm = (regs[2] & (1 << 2)) != 0;
+    }
+
+    const bool hwVirtualization = vmx || svm;
+
+    // PF_VIRT_FIRMWARE_ENABLED (23): firmware has hardware virtualization turned on
+    const bool firmwareEnabled = IsProcessorFeaturePresent(23) != 0;
+    // PF_HYPERVISOR_PRESENT (40): a hypervisor is currently running
+    bool hypervisorPresent = IsProcessorFeaturePresent(40) != 0;
+    if (!hypervisorPresent) {
+        // Registry fallback (written by the kernel when the hypervisor boots)
+        DWORD hvReg = 0;
+        if (Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE,
+            "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Virtualization",
+            "HypervisorPresent", &hvReg)) {
+            hypervisorPresent = hvReg != 0;
+        }
+    }
+
+    if (!hwVirtualization) {
+        Helper::printSuccess("- CPU does not support hardware virtualization", false);
+        Helper::recordResult("CPU-V", "OK", "Not supported by CPU");
+        return;
+    }
+
+    const std::string tech = vmx ? "VT-x" : "SVM";
+    if (firmwareEnabled) {
+        std::string detail = "Enabled in BIOS (" + tech + ")";
+        if (hypervisorPresent) detail += ", hypervisor active";
+        Helper::printConcern("- CPU-V is enabled in BIOS (" + tech + "). Consider disabling in BIOS if not needed");
+        Helper::recordResult("CPU-V", "WARN", detail);
+    }
+    else {
+        std::string detail = "Disabled in BIOS (" + tech + ")";
+        if (hypervisorPresent) detail += ", hypervisor active";
+        Helper::printSuccess("- CPU virtualization disabled in BIOS (" + tech + ")", false);
+        Helper::recordResult("CPU-V", "OK", detail);
+    }
+}
+
+// v1.2.1: raw SMBIOS identity scoring + registry cross-check to spot perm HWID spoofers
+void Checks::checkSpoofer()
+{
+    SetConsoleTitleA("Checking for HWID Spoofer");
+
+    SmbiosIdentity id = readSmbiosIdentity();
+    if (!id.valid) {
+        Helper::printConcern("- Could not read SMBIOS identity");
+        Helper::recordResult("HWID Spoofer", "WARN", "SMBIOS unreadable");
+        return;
+    }
+
+    struct Field { const char* name; const std::string* value; bool identityCore; };
+    const Field fields[] = {
+        { "System Manufacturer", &id.systemManufacturer, true },
+        { "System Product",      &id.systemProduct,      true },
+        { "System Version",      &id.systemVersion,      false },
+        { "System Serial",       &id.systemSerial,       false },
+        { "Board Manufacturer",  &id.boardManufacturer,  true },
+        { "Board Product",       &id.boardProduct,       true },
+        { "Board Version",       &id.boardVersion,       false },
+        { "Board Serial",        &id.boardSerial,        false },
+    };
+
+    int strongHits = 0;
+    int weakHits = 0;
+    std::string strongList;
+    std::string weakList;
+
+    auto addHit = [](std::string& list, const std::string& entry) {
+        if (!list.empty()) list += "; ";
+        list += entry;
+    };
+
+    for (const Field& field : fields) {
+        bool wasStrong = false;
+        const int score = identityScore(*field.value, &wasStrong);
+        if (score == 2) {
+            // Hex/synthetic values are suspicious in ANY field
+            strongHits++;
+            addHit(strongList, std::string(field.name) + "=" + *field.value);
+        }
+        else if (score == 1 && field.identityCore) {
+            // Placeholders/random tokens only count in manufacturer/product:
+            // "To be filled by O.E.M." in serial/version is normal OEM sloppiness
+            weakHits++;
+            addHit(weakList, std::string(field.name) + "=" + *field.value);
+        }
+    }
+
+    if (id.uuidNil) {
+        weakHits++;
+        addHit(weakList, "SMBIOS UUID is empty");
+    }
+
+    // Odd SMBIOS version (real firmware reports 2.x or 3.x)
+    if (id.smbiosMajor < 2 || id.smbiosMajor > 3) {
+        weakHits++;
+        addHit(weakList, "SMBIOS version " + std::to_string(id.smbiosMajor) + "." +
+            std::to_string(id.smbiosMinor));
+    }
+
+    // Cross-check against the registry copy written at boot: a spoofer that
+    // patches the SMBIOS view but not this key (or vice versa) shows up here
+    struct RegPair { const char* regName; const std::string* smbiosValue; };
+    const RegPair regPairs[] = {
+        { "SystemManufacturer",     &id.systemManufacturer },
+        { "SystemProductName",      &id.systemProduct },
+        { "BaseBoardManufacturer",  &id.boardManufacturer },
+        { "BaseBoardProduct",       &id.boardProduct },
+    };
+    for (const RegPair& pair : regPairs) {
+        const std::string regValue = readRegistryStringValue(HKEY_LOCAL_MACHINE,
+            "HARDWARE\\DESCRIPTION\\System\\BIOS", pair.regName);
+        if (identityDiffers(*pair.smbiosValue, regValue)) {
+            strongHits++;
+            addHit(strongList, std::string(pair.regName) + " differs (SMBIOS=" +
+                *pair.smbiosValue + ", registry=" + regValue + ")");
+        }
+    }
+
+    if (strongHits >= 2) {
+        Helper::printError("- Likely HWID spoofer detected (" + std::to_string(strongHits) +
+            " strong indicators): " + strongList);
+        Helper::recordResult("HWID Spoofer", "FAIL", strongList);
+    }
+    else if (strongHits == 1) {
+        Helper::printConcern("- Suspicious identity value: " + strongList);
+        Helper::recordResult("HWID Spoofer", "WARN", strongList);
+    }
+    else if (weakHits >= 2) {
+        Helper::printConcern("- Possible identity tampering: " + weakList);
+        Helper::recordResult("HWID Spoofer", "WARN", weakList);
+    }
+    else {
+        Helper::printSuccess("- No spoofer indicators (SMBIOS + registry consistent)", false);
+        Helper::recordResult("HWID Spoofer", "OK", "Identity looks consistent");
+    }
+}
+
 void Helper::setupConsole()
 {
     HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
@@ -1967,6 +2804,12 @@ void Helper::setupConsole()
     GetConsoleMode(hStdin, &mode);
     SetConsoleMode(hStdin, mode & ~(ENABLE_QUICK_EDIT_MODE | ENABLE_EXTENDED_FLAGS));
     SetConsoleTitleA("Initializing");
+
+    // v1.2.1: start maximized so every check line is visible without scrolling
+    HWND console = GetConsoleWindow();
+    if (console != NULL) {
+        ShowWindow(console, SW_MAXIMIZE);
+    }
 }
 
 void Helper::printSuccess(const std::string& message, bool changed)
@@ -2013,6 +2856,21 @@ void Helper::runSystemCommand(const char* command)
     char buffer[1024];
     while (fgets(buffer, sizeof(buffer), stream) != NULL) {}
     _pclose(stream);
+}
+
+int Helper::runSystemCommandExitCode(const char* command)
+{
+    if (command == NULL) return -1;
+    std::string modifiedCommand = command;
+    if (modifiedCommand.find("2>nul") == std::string::npos &&
+        modifiedCommand.find("2>&1") == std::string::npos) {
+        modifiedCommand += " 2>nul";
+    }
+    FILE* stream = _popen(modifiedCommand.c_str(), "r");
+    if (stream == NULL) return -1;
+    char buffer[1024];
+    while (fgets(buffer, sizeof(buffer), stream) != NULL) {}
+    return _pclose(stream);
 }
 
 bool Helper::readDwordValueRegistry(HKEY hKeyParent, LPCSTR subkey, LPCSTR valueName, DWORD* readData) {

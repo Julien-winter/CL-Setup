@@ -101,6 +101,9 @@ namespace Checks {
     void checkSecurityMitigations();
     void checkUAC();
     void checkWindowsUpdate();
+
+    void checkCPUVirtualization();
+    void checkSpoofer();
 }
 namespace Helper {
     extern bool restartRequired;
@@ -130,10 +133,14 @@ namespace Helper {
     void printError(const std::string& message);
     void printInfo(const std::string& message);
     void runSystemCommand(const char* command);
+    int runSystemCommandExitCode(const char* command);
     std::string runSystemCommandWithOutput(const char* command, DWORD timeoutMs);
     bool readDwordValueRegistry(HKEY hKeyParent, LPCSTR subkey, LPCSTR valueName, DWORD* readData);
     ServiceStatus getServiceStatus(LPCSTR serviceName);
     void backupRegistryKey(HKEY hKeyParent, const std::string& subkey);
+    // Appends one applied change to %LOCALAPPDATA%\CL-Setup\applied-changes.log;
+    // Undo-CL-Setup.ps1 reads it to revert exactly what this run changed
+    void logAppliedChange(const std::string& change);
 
     bool isAdmin();
     void initLogging();
@@ -147,6 +154,7 @@ namespace Helper {
     bool hasPendingChanges();
     void printPendingChanges();
     bool promptApplyChanges();
+    void showShopInfo();
     void clearResults();
 
     void recordResult(const std::string& check, const std::string& status, const std::string& message);

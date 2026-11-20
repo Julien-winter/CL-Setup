@@ -145,6 +145,12 @@ int main(int argc, char* argv[])
     if (!Helper::isCheckSkipped(25)) Checks::checkWindowsUpdate();
     else { Helper::printConcern("- Skipped: Windows Update"); Helper::recordResult("Windows Update", "SKIPPED", ""); }
 
+    if (!Helper::isCheckSkipped(26)) Checks::checkCPUVirtualization();
+    else { Helper::printConcern("- Skipped: CPU-V"); Helper::recordResult("CPU-V", "SKIPPED", ""); }
+
+    if (!Helper::isCheckSkipped(27)) Checks::checkSpoofer();
+    else { Helper::printConcern("- Skipped: HWID Spoofer"); Helper::recordResult("HWID Spoofer", "SKIPPED", ""); }
+
     // Count warnings and failures
     for (const auto& r : Helper::g_results) {
         if (r.status == "WARN") warningCount++;
@@ -175,6 +181,7 @@ int main(int argc, char* argv[])
             if (!Helper::isCheckSkipped(2)) Checks::check3rdPartyAntiVirus();
             if (!Helper::isCheckSkipped(4)) Checks::uninstallRiotVanguard();
             if (!Helper::isCheckSkipped(5)) Checks::installVCRedist();
+            if (!Helper::isCheckSkipped(6)) Checks::isChromeInstalled();
             if (!Helper::isCheckSkipped(7)) Checks::disableChromeProtection();
             if (!Helper::isCheckSkipped(8)) Checks::syncWindowsTime();
             if (!Helper::isCheckSkipped(10)) Checks::deleteSymbols();
@@ -184,6 +191,9 @@ int main(int argc, char* argv[])
             if (!Helper::isCheckSkipped(14)) Checks::checkGameBar();
             if (!Helper::isCheckSkipped(16)) Checks::checkCoreIsolation();
             if (!Helper::isCheckSkipped(19)) Checks::checkInternet();
+            // v1.2.1: adapter removal runs through requestChange - without the
+            // apply re-run the approved pnputil removal never executed
+            if (!Helper::isCheckSkipped(20)) Checks::checkNetworkAdapters();
             if (!Helper::isCheckSkipped(23)) Checks::checkSecurityMitigations();
 
             // Re-count after applying changes
