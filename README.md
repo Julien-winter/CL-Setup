@@ -10,6 +10,11 @@ The purpose of this program is to help the user setup the CL Client by doing all
 
 ## Changes & Bug Fixes
 
+### v1.2.3
+
+**Changed**
+- The shop info box that appears after the "Apply setup changes?" dialog can now be turned off **silently**: set `showShopInfo=false` in `%TEMP%\CL-Setup\settings.ini`. The file is created with `showShopInfo=true` on the first run, nothing is ever printed in the console about it (values `false` / `0` / `no` / `off` are accepted, comments start with `#` or `;`)
+
 ### v1.2.2
 
 **Added**

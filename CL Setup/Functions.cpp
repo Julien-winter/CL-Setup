@@ -17,7 +17,7 @@ namespace Helper {
     bool applyChanges = false;
     std::string g_repoUrl = "Julien-winter/CL-Setup";
     std::string g_appName = "CL-Setup";
-    std::string g_appVersion = "1.2.2";
+    std::string g_appVersion = "1.2.3";
     int g_exitCode = 0;
 }
 
@@ -565,10 +565,53 @@ void Helper::printPendingChanges()
     }
 }
 
+// v1.2.3: %TEMP%\CL-Setup\settings.ini - edit showShopInfo=true -> false to
+// silence the promo box silently (no console output either way)
+namespace {
+    std::string shopSettingsPath()
+    {
+        char tempPath[MAX_PATH] = { 0 };
+        if (GetTempPathA(MAX_PATH, tempPath) == 0 || tempPath[0] == '\0') return "";
+        std::string dir = std::string(tempPath) + "CL-Setup";
+        CreateDirectoryA(dir.c_str(), NULL);
+        return dir + "\\settings.ini";
+    }
+
+    bool shopInfoEnabled()
+    {
+        std::string path = shopSettingsPath();
+        if (path.empty()) return true;
+
+        std::ifstream in(path);
+        if (!in) {
+            // first run: create the file with the default so it can be found and edited
+            std::ofstream out(path);
+            if (out) out << "showShopInfo=true\n";
+            return true;
+        }
+
+        std::string line;
+        while (std::getline(in, line)) {
+            line = trimCopy(line);
+            if (line.empty() || line[0] == '#' || line[0] == ';') continue;
+            size_t eq = line.find('=');
+            if (eq == std::string::npos) continue;
+            std::string key = toLowerCopy(trimCopy(line.substr(0, eq)));
+            std::string value = toLowerCopy(trimCopy(line.substr(eq + 1)));
+            if (key == "showshopinfo") {
+                return !(value == "false" || value == "0" || value == "no" || value == "off");
+            }
+        }
+        return true;
+    }
+}
+
 // v1.2.1: shop info box shown right after the apply-changes yes/no dialog
 void Helper::showShopInfo()
 {
     if (cliConfig.headless) return;
+    // v1.2.3: opt-out via %TEMP%\CL-Setup\settings.ini (showShopInfo=false)
+    if (!shopInfoEnabled()) return;
     MessageBoxA(NULL,
         "You can buy alt accounts for cheap from shop.uchiha.us\n"
         "You can buy CL from Main shop at: cheatloverz.store",
