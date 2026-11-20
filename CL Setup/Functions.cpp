@@ -116,7 +116,10 @@ namespace {
             }
 
             std::string adapterGuid;
-            HKEY driverKey = SetupDiOpenDevRegKey(deviceInfo, &data, DIREG_DRV, 0, DIREG_READ, KEY_READ);
+            // Scope must be DICS_FLAG_GLOBAL/DICS_FLAG_CONFIGSPECIFIC and KeyType
+            // DIREG_DEV/DIREG_DRV - "DIREG_READ" does not exist in the Windows SDK.
+            // DIREG_DRV opens the driver (software) key that holds NetCfgInstanceId.
+            HKEY driverKey = SetupDiOpenDevRegKey(deviceInfo, &data, DICS_FLAG_GLOBAL, 0, DIREG_DRV, KEY_READ);
             if (driverKey != NULL && driverKey != INVALID_HANDLE_VALUE) {
                 char guidBuffer[128] = { 0 };
                 DWORD size = sizeof(guidBuffer);
