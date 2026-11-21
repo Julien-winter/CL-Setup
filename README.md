@@ -17,6 +17,7 @@ The purpose of this program is to help the user setup the CL Client by doing all
 
 **Changed**
 - **Winver 26H2 is reported as "(not supported)"**: build 26300 now reads `- Winver "Win11 26H2" (not supported)` (still WARN) instead of the generic 50/50 wording - 25H2 and unknown future builds keep the 50/50 text
+- **Loopback no longer listed**: `Loopback Pseudo-Interface 1` (Windows' own 127.0.0.1 interface, present on every system, not removable, no external traffic) is hidden from the adapter list and no longer counted in used/total or the summary
 
 ### v1.2.3
 
