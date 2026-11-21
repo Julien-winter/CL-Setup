@@ -10,6 +10,14 @@ The purpose of this program is to help the user setup the CL Client by doing all
 
 ## Changes & Bug Fixes
 
+### v1.2.4
+
+**Added**
+- **Kick warning on flagged network adapters**: every adapter classified as VPN/virtual now gets an orange ` (can cause game kicks)` suffix on its console line (e.g. `NordVPN - USED (Up) [virtual] (can cause game kicks)`) - the summary/JSON entry carries the same text, and `--quiet` still shows the warning by itself
+
+**Changed**
+- **Winver 26H2 is reported as "(not supported)"**: build 26300 now reads `- Winver "Win11 26H2" (not supported)` (still WARN) instead of the generic 50/50 wording - 25H2 and unknown future builds keep the 50/50 text
+
 ### v1.2.3
 
 **Added**

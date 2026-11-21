@@ -20,7 +20,7 @@ namespace Helper {
     std::unordered_set<std::string> g_printedLines;
     std::string g_repoUrl = "Julien-winter/CL-Setup";
     std::string g_appName = "CL-Setup";
-    std::string g_appVersion = "1.2.3";
+    std::string g_appVersion = "1.2.4";
     int g_exitCode = 0;
 }
 
@@ -1374,15 +1374,20 @@ void Checks::checkNetworkAdapters()
         else if (virtualCandidate) line += " [virtual]";
         else if (!isUsed) line += instanceId.empty() ? " [unknown]" : " [hardware]";
 
+        // v1.2.4: flagged adapters (VPNs, virtual adapters) warn in orange -
+        // a VPN/virtual NIC is a classic reason for game kicks
+        std::string kickWarn;
+        if (virtualCandidate) kickWarn = " (can cause game kicks)";
+
         if (isUsed) {
-            Helper::printSuccess("- Adapter: " + line, false);
+            Helper::printAdapterLine("- Adapter: " + line, true, kickWarn);
         }
         else {
-            Helper::printInfo("Adapter: " + line);
+            Helper::printAdapterLine("Adapter: " + line, false, kickWarn);
         }
 
         if (!summary.empty()) summary += "; ";
-        summary += line;
+        summary += line + kickWarn;
     }
 
     if (total == 0) {
@@ -2776,8 +2781,17 @@ void Checks::checkWinver()
     }
     else if (build >= fiftyFiftyFrom ||
         std::find(trouble.begin(), trouble.end(), build) != trouble.end()) {
-        Helper::printConcern("- Winver \"" + winver + "\" is a 50/50, if error contact support");
-        Helper::recordResult("Winver", "WARN", winver + " is a 50/50, if error contact support");
+        // v1.2.4: 26H2 (26300) is explicitly not supported (user decision) -
+        // wording only, the verdict stays WARN; 25H2 and unknown future
+        // builds keep the 50/50 text
+        if (build == 26300) {
+            Helper::printConcern("- Winver \"" + winver + "\" (not supported)");
+            Helper::recordResult("Winver", "WARN", winver + " (not supported)");
+        }
+        else {
+            Helper::printConcern("- Winver \"" + winver + "\" is a 50/50, if error contact support");
+            Helper::recordResult("Winver", "WARN", winver + " is a 50/50, if error contact support");
+        }
     }
     else {
         Helper::printSuccess("- Winver is supported (" + winver + ")", false);
@@ -3766,6 +3780,36 @@ void Helper::printError(const std::string& message)
     std::cout << "[X] ";
     Color::setForegroundColor(Color::White);
     std::cout << message << std::endl;
+}
+
+// v1.2.4: adapter line with an orange kick-risk suffix for flagged
+// (VPN/virtual) adapters; --quiet keeps only the warning itself
+void Helper::printAdapterLine(const std::string& message, bool used, const std::string& orangeSuffix)
+{
+    std::lock_guard<std::mutex> lock(consoleMutex);
+    if (!g_printedLines.insert(std::string(used ? "[+]" : "[i]") + message + orangeSuffix).second) return;
+    if (cliConfig.quiet) {
+        if (orangeSuffix.empty()) return;
+        Color::setForegroundColor(Color::Orange);
+        std::cout << "[!] " << message << orangeSuffix << std::endl;
+        return;
+    }
+    if (used) {
+        Color::setForegroundColor(Color::Green);
+        std::cout << "[+] ";
+        Color::setForegroundColor(Color::White);
+    }
+    else {
+        Color::setForegroundColor(Color::LightGray);
+        std::cout << "  ";
+    }
+    std::cout << message;
+    if (!orangeSuffix.empty()) {
+        Color::setForegroundColor(Color::Orange);
+        std::cout << orangeSuffix;
+        Color::setForegroundColor(Color::LightGray);
+    }
+    std::cout << std::endl;
 }
 
 void Helper::runSystemCommand(const char* command)

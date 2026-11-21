@@ -137,6 +137,9 @@ namespace Helper {
     void printConcern(const std::string& message);
     void printError(const std::string& message);
     void printInfo(const std::string& message);
+    // v1.2.4: adapter line with an orange warning suffix (kick risk on
+    // flagged VPN/virtual adapters), also keeps the warning in --quiet
+    void printAdapterLine(const std::string& message, bool used, const std::string& orangeSuffix);
     void runSystemCommand(const char* command);
     int runSystemCommandExitCode(const char* command);
     std::string runSystemCommandWithOutput(const char* command, DWORD timeoutMs);
@@ -179,4 +182,6 @@ namespace Color {
     inline RGBColor LightGray = { 211, 211, 211 };
     inline RGBColor DarkGray = { 128, 128, 128 };
     inline RGBColor White = { 255, 255, 255 };
+    // v1.2.4: kick-risk warnings on flagged network adapters
+    inline RGBColor Orange = { 255, 165, 0 };
 }
