@@ -173,7 +173,8 @@ namespace {
 
     // v1.2.2: SHORT BIOS path for the detected board, appended in the SAME line
     // topic: "tpm" | "secureboot" | "cpuv"
-    std::string biosHint(const char* topic)
+    // amdSvm: on AMD boards the CPU-V toggle is called "SVM Mode" (v1.2.3)
+    std::string biosHint(const char* topic, bool amdSvm = false)
     {
         const std::string t = topic;
         const std::string vendor = mainboardVendor();
@@ -197,7 +198,20 @@ namespace {
             else path = "BIOS > Secure Boot > Disabled";
         }
         else { // "cpuv"
-            if (vendor == "ASUS") path = "Advanced > CPU Config > VT-x";
+            // v1.2.3: AMD-first hint - the old table always said VT-x, so AMD
+            // users (e.g. MSI B650, CPU-V=SVM) got a menu entry that does not
+            // exist on their board. Intel machines keep the exact old strings.
+            if (amdSvm) {
+                if (vendor == "ASUS") path = "Advanced > CPU Config > SVM Mode";
+                else if (vendor == "MSI") path = "OC > CPU Features > SVM Mode";
+                else if (vendor == "Gigabyte") path = "Tweaker > SVM Mode";
+                else if (vendor == "ASRock") path = "Advanced > CPU Config > SVM Mode";
+                else if (vendor == "Dell") path = "CPU > SVM Mode";
+                else if (vendor == "HP") path = "Security > SVM Mode";
+                else if (vendor == "Lenovo") path = "Config > CPU > SVM Mode";
+                else path = "BIOS > CPU Config > SVM Mode";
+            }
+            else if (vendor == "ASUS") path = "Advanced > CPU Config > VT-x";
             else if (vendor == "MSI") path = "OC > CPU Features > VT-x";
             else if (vendor == "Gigabyte") path = "Tweaker > VT-x / SVM Mode";
             else if (vendor == "ASRock") path = "Advanced > CPU Config > VT-x/SVM";
@@ -2742,6 +2756,9 @@ void Checks::checkWinver()
         {19041, "Win10 2004"}, {19042, "Win10 20H2"}, {19043, "Win10 21H1"}, {19044, "Win10 21H2"},
         {19045, "Win10 22H2"}, {22000, "Win11 21H2"}, {22621, "Win11 22H2"}, {22631, "Win11 23H2"},
         {26100, "Win11 24H2"}, {26200, "Win11 25H2"},
+        // v1.2.3: name the current releases instead of a bare "Build 26300" -
+        // the 50/50 verdict itself stays (fiftyFiftyFrom below, user decision)
+        {26300, "Win11 26H2"}, {28000, "Win11 26H1"},
     };
     int min_build = 19041;
     std::vector<int> trouble = {19045, 22621};
@@ -2851,7 +2868,8 @@ void Checks::checkExploitProtection()
         // settings) - it does NOT disable the protections themselves. The old
         // "is disabled" wording claimed the opposite of what the value does.
         if (status == 1) {
-            Helper::printSuccess("- Exploit-Protection changes are locked by policy (protections stay active)", false);
+            // v1.2.3: no console line for the OK state - "locked by policy"
+            // was screenshot noise nobody acts on; log/JSON/summary keep it
             Helper::recordResult("Exploit Protection", "OK", "Override locked by policy");
             return;
         }
@@ -3280,6 +3298,35 @@ void Checks::checkDMAProtection()
         return;
     }
 
+    // v1.2.3: read the actual state the way msinfo32 does -
+    // NtQuerySystemInformation(SystemDmaGuardPolicyInformation = 202) returns
+    // the DmaGuard on/off flag as a single BOOLEAN (the query the
+    // Harden-Windows-Security compliance module uses to mirror the
+    // "Kernel DMA Protection" field of msinfo32). Ends the old
+    // "state unknown - verify in msinfo32" WARN.
+    //   1 = protection enabled -> FAIL (same verdict as the registry branches)
+    //   0 = system reports Off -> OK/WARN (support flag consulted below)
+    //   query failed           -> WMI-only logic below (old behaviour)
+    typedef LONG(NTAPI* NtQuerySystemInformation_t)(ULONG, PVOID, ULONG, PULONG);
+    static NtQuerySystemInformation_t ntQuerySystemInformation =
+        reinterpret_cast<NtQuerySystemInformation_t>(
+            GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQuerySystemInformation"));
+    // -1 = query failed (old WMI-only behaviour below), 0 = Off, 1 = enabled
+    int dmaOn = -1;
+    if (ntQuerySystemInformation) {
+        // this class wants a buffer of exactly 1 byte (larger buffers fail
+        // with STATUS_INFO_LENGTH_MISMATCH - verified on Win11)
+        UCHAR stateByte = 0;
+        ULONG retLen = 0;
+        if (ntQuerySystemInformation(202, &stateByte, 1, &retLen) == 0 /* STATUS_SUCCESS */)
+            dmaOn = stateByte ? 1 : 0;
+    }
+    if (dmaOn == 1) {
+        Helper::printError("- Kernel DMA Protection is enabled");
+        Helper::recordResult("DMA Protection", "FAIL", "Enabled (state read directly)");
+        return;
+    }
+
     // v1.2.1: registry has no state -> ask Win32_DeviceGuard (the source msinfo32 uses)
     std::string deviceGuardCommand =
         "powershell -NoProfile -NonInteractive -Command \""
@@ -3293,12 +3340,26 @@ void Checks::checkDMAProtection()
     // supporting systems enable it automatically) - claiming "currently off"
     // here could never fail. Without a readable state the answer is unknown.
     if (available.empty()) {
+        if (dmaOn == 0) {
+            // state read says Off even though the support flag is unavailable
+            Helper::printSuccess("- Kernel DMA Protection is disabled (system reports Off)", false);
+            Helper::recordResult("DMA Protection", "OK", "Disabled (state read directly)");
+            return;
+        }
         Helper::printConcern("- Could not determine Kernel DMA Protection state (WMI query failed)");
         Helper::recordResult("DMA Protection", "WARN", "State unknown (WMI query failed)");
     }
     else if (csvContains(available, 3)) {
-        Helper::printConcern("- Kernel DMA Protection is supported by firmware - verify state in msinfo32");
-        Helper::recordResult("DMA Protection", "WARN", "Supported by firmware, state unknown");
+        if (dmaOn == 0) {
+            // supported by firmware but the system reports Off (typically
+            // IOMMU/VT-d disabled in BIOS) - name it instead of "unknown"
+            Helper::printConcern("- Kernel DMA Protection is supported by firmware but reports Off - verify state in msinfo32");
+            Helper::recordResult("DMA Protection", "WARN", "Supported by firmware, reports Off");
+        }
+        else {
+            Helper::printConcern("- Kernel DMA Protection is supported by firmware - verify state in msinfo32");
+            Helper::recordResult("DMA Protection", "WARN", "Supported by firmware, state unknown");
+        }
     }
     else {
         Helper::printSuccess("- Kernel DMA Protection is not supported / not active", false);
@@ -3432,7 +3493,7 @@ void Checks::checkCPUVirtualization()
         std::string detail = "Enabled in BIOS (" + tech + ")";
         if (hypervisorPresent) detail += ", hypervisor active";
         Helper::printConcern("- CPU-V is enabled in BIOS (" + tech + "), disable it in BIOS if not needed " +
-            biosHint("cpuv"));
+            biosHint("cpuv", tech == "SVM"));
         Helper::recordResult("CPU-V", "WARN", detail);
     }
     else {
@@ -3548,11 +3609,14 @@ void Checks::checkSpoofer()
     if (strongHits >= 2) {
         Helper::printError("- Likely HWID spoofer detected (" + std::to_string(strongHits) +
             " strong indicators): " + strongList);
-        Helper::recordResult("HWID Spoofer", "FAIL", strongList);
+        Helper::recordResult("HWID Spoofer", "FAIL",
+            std::to_string(strongHits) + " strong indicators: " + strongList);
     }
     else if (strongHits == 1) {
         Helper::printConcern("- Suspicious identity value: " + strongList);
-        Helper::recordResult("HWID Spoofer", "WARN", strongList);
+        // v1.2.3: summary carries the same wording as the console line -
+        // "HWID Spoofer: Board Serial=..." alone read like a verdict
+        Helper::recordResult("HWID Spoofer", "WARN", "Suspicious identity value: " + strongList);
     }
     else if (weakHits >= 3) {
         // v1.2.2 bugfix: two WEAK hits were too easy to reach on stock
@@ -3560,7 +3624,7 @@ void Checks::checkSpoofer()
         // as "H610M-K" already counted as 2) - require three independent
         // weak indicators before suggesting tampering
         Helper::printConcern("- Possible identity tampering: " + weakList);
-        Helper::recordResult("HWID Spoofer", "WARN", weakList);
+        Helper::recordResult("HWID Spoofer", "WARN", "Possible identity tampering: " + weakList);
     }
     else {
         Helper::printSuccess("- No spoofer indicators (SMBIOS + registry consistent)", false);
