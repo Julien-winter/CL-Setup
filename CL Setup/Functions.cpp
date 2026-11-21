@@ -1337,6 +1337,12 @@ void Checks::checkNetworkAdapters()
     std::vector<UnusedCandidate> unusedVirtual;
 
     for (PIP_ADAPTER_ADDRESSES adapter = adapters; adapter != NULL; adapter = adapter->Next) {
+        // v1.2.4: Windows' own loopback (127.0.0.1) is hidden - it exists on
+        // every system, cannot be removed and never carries external traffic,
+        // so it was pure screenshot noise ("why is this kept?"). Skipping it
+        // here also keeps it out of the used/total count and the summary.
+        if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+
         total++;
 
         std::string name = wideToUtf8(adapter->FriendlyName);
