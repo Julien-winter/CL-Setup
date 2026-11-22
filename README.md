@@ -14,6 +14,7 @@ The purpose of this program is to help the user setup the CL Client by doing all
 
 **Added**
 - **Kick warning on flagged network adapters**: every adapter classified as VPN/virtual now gets an orange ` (can cause game kicks)` suffix on its console line (e.g. `NordVPN - USED (Up) [virtual] (can cause game kicks)`) - the summary/JSON entry carries the same text, and `--quiet` still shows the warning by itself
+- **Activation watermark can be hidden**: for the non-licensed states (not activated, grace, notification mode) the check now offers `Hide the activation watermark (cosmetic - does not activate Windows)` as a pending change - it sets `NotificationDisabled=1` (SoftwareProtectionPlatform\Activation) plus `PaintDesktopVersion=0` and needs a restart to take effect. Both keys are exported to the undo backup first and reverted by `Undo-CL-Setup.ps1`. The license state itself is never touched (still no key installation, still read-only status reporting)
 
 **Changed**
 - **Winver 26H2 is reported as "(not supported)"**: build 26300 now reads `- Winver "Win11 26H2" (not supported)` (still WARN) instead of the generic 50/50 wording - 25H2 and unknown future builds keep the 50/50 text

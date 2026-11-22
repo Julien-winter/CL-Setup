@@ -3706,8 +3706,61 @@ void Checks::checkSpoofer()
     }
 }
 
-// v1.2.2: read-only activation status - reports the state, never activates or
-// modifies anything (no key installation, no watermark tampering)
+namespace {
+    // v1.2.4: small helper for the watermark hide - writes one REG_DWORD,
+    // creating the key when needed; returns the Reg* result code
+    LONG writeDwordValue(HKEY parent, const char* subkey, const char* valueName, DWORD value)
+    {
+        HKEY hKey = NULL; DWORD disp = 0;
+        LONG rc = RegCreateKeyEx(parent, subkey, 0, NULL, REG_OPTION_NON_VOLATILE,
+            KEY_READ | KEY_WRITE, NULL, &hKey, &disp);
+        if (rc != ERROR_SUCCESS) return rc;
+        rc = RegSetValueEx(hKey, valueName, NULL, REG_DWORD,
+            (const BYTE*)&value, sizeof(value));
+        RegCloseKey(hKey);
+        return rc;
+    }
+
+    // v1.2.4: hide the visible activation watermark (COSMETIC ONLY - this does
+    // NOT activate Windows, no key is installed, the license state is never
+    // touched). Both keys are exported before the write so Undo-CL-Setup.ps1
+    // can restore them. Returns true when the change was applied; when it is
+    // only pending approval or the write failed the result is recorded here.
+    bool offerActivationWatermarkHide(const std::string& stateMsg)
+    {
+        if (!Helper::requestChange("Hide the activation watermark (cosmetic - does not activate Windows)")) {
+            Helper::recordResult("Activation", "WARN", stateMsg + " - watermark hide pending approval");
+            return false;
+        }
+
+        const char* actKey =
+            "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\SoftwareProtectionPlatform\\Activation";
+        Helper::backupRegistryKey(HKEY_LOCAL_MACHINE, actKey);
+        Helper::backupRegistryKey(HKEY_CURRENT_USER, "Control Panel\\Desktop");
+
+        // NotificationDisabled=1 stops the notification-mode watermark, and
+        // PaintDesktopVersion=0 hides the desktop watermark layer - both need
+        // a restart to take effect (restartRequired is set below)
+        LONG rc1 = writeDwordValue(HKEY_LOCAL_MACHINE, actKey, "NotificationDisabled", 1);
+        LONG rc2 = writeDwordValue(HKEY_CURRENT_USER, "Control Panel\\Desktop",
+            "PaintDesktopVersion", 0);
+        if (rc1 == ERROR_SUCCESS && rc2 == ERROR_SUCCESS) {
+            Helper::logAppliedChange("reg:" + std::string(actKey));
+            Helper::logAppliedChange("reg:Control Panel\\Desktop");
+            Helper::restartRequired = true;
+            Helper::printSuccess("- Activation watermark hidden (restart required to apply)", true);
+            Helper::recordResult("Activation", "OK", stateMsg + " - watermark hidden (cosmetic)");
+            return true;
+        }
+        Helper::printError("- Failed to hide the activation watermark");
+        Helper::recordResult("Activation", "FAIL", stateMsg + " - watermark hide failed");
+        return false;
+    }
+}
+
+// v1.2.2: reports the state, never activates anything (no key installation).
+// v1.2.4: the license state itself stays untouched, but the VISIBLE watermark
+// can now be hidden on approval - cosmetic only, restart required
 void Checks::checkActivation()
 {
     SetConsoleTitleA("Checking Activation Status");
@@ -3757,25 +3810,24 @@ void Checks::checkActivation()
     case 0:
         Helper::printConcern("- Windows is not activated - activate with a valid license key "
             "(Settings > System > Activation)");
-        Helper::recordResult("Activation", "WARN",
-            "Not activated - activate with a valid license key");
+        offerActivationWatermarkHide("Not activated");
         break;
     case 4:
         Helper::printConcern("- Windows reports a non-genuine grace period");
-        Helper::recordResult("Activation", "WARN", "Non-genuine grace period");
+        offerActivationWatermarkHide("Non-genuine grace period");
         break;
     case 5:
         Helper::printConcern("- Windows is in notification mode - the activation watermark "
             "can be visible until a valid license key is entered");
-        Helper::recordResult("Activation", "WARN",
-            "Notification mode - activation watermark can be visible");
+        offerActivationWatermarkHide("Notification mode");
         break;
     case 6:
         Helper::printConcern("- Windows is in extended grace period");
-        Helper::recordResult("Activation", "WARN", "Extended grace period");
+        offerActivationWatermarkHide("Extended grace period");
         break;
     default:
         Helper::printConcern("- Unknown activation state (LicenseStatus=" + token + ")");
+        // unknown state - no watermark verdict, keep it read-only
         Helper::recordResult("Activation", "WARN", "Unknown LicenseStatus " + token);
         break;
     }
