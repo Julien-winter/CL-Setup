@@ -2513,6 +2513,56 @@ void Checks::checkSecureBoot()
     DWORD secbootStatus = 0;
     bool stateRead = Helper::readDwordValueRegistry(HKEY_LOCAL_MACHINE,
         "SYSTEM\\CurrentControlSet\\Control\\SecureBoot\\State", "UEFISecureBootEnabled", &secbootStatus);
+    const char* stateSource = "registry";
+
+    // v1.2.4 fix: the State key is missing on some machines (Windows originally
+    // installed in legacy mode, later switched to UEFI, OEM images) - the registry
+    // miss must not end the check, read the SecureBoot UEFI variable directly
+    if (!stateRead && firmwareType == 2) {
+        HANDLE hToken = NULL;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+            TOKEN_PRIVILEGES tp = {};
+            if (LookupPrivilegeValueA(NULL, SE_SYSTEM_ENVIRONMENT_NAME, &tp.Privileges[0].Luid)) {
+                tp.PrivilegeCount = 1;
+                tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
+            }
+            CloseHandle(hToken);
+        }
+        // EFI_GLOBAL_VARIABLE: the SecureBoot variable is one byte, 1 = enabled
+        // (the W-API takes the vendor GUID as a string, not as a GUID struct)
+        unsigned char sbVar[4] = {};
+        DWORD sbLen = GetFirmwareEnvironmentVariableW(L"SecureBoot",
+            L"{8BE4DF61-93CA-11d2-AA0D-00E098032B8C}", sbVar, sizeof(sbVar));
+        if (sbLen == 1) {
+            secbootStatus = sbVar[0] ? 1 : 0;
+            stateRead = true;
+            stateSource = "firmware variable";
+        }
+        else {
+            DWORD err = GetLastError();
+            // no SecureBoot variable at all -> the firmware cannot enable it;
+            // any OTHER error keeps the chain going (PowerShell fallback below)
+            if (err == ERROR_ENVVAR_NOT_FOUND || err == ERROR_INVALID_FUNCTION) {
+                Helper::printSuccess("- Secure-Boot is not available (firmware reports no Secure-Boot)", false);
+                Helper::recordResult("Secure Boot", "OK", "Not supported by firmware");
+                return;
+            }
+        }
+    }
+
+    // last resort: the PowerShell cmdlet reads the state via a different path
+    if (!stateRead && firmwareType == 2) {
+        std::string sbOut = Helper::runSystemCommandWithOutput(
+            "powershell -NoProfile -Command \"Confirm-SecureBootUEFI\"", 20000);
+        if (sbOut == "TIMEOUT") sbOut.clear();
+        if (sbOut.find("True") != std::string::npos) {
+            secbootStatus = 1; stateRead = true; stateSource = "Confirm-SecureBootUEFI";
+        }
+        else if (sbOut.find("False") != std::string::npos) {
+            secbootStatus = 0; stateRead = true; stateSource = "Confirm-SecureBootUEFI";
+        }
+    }
 
     if (!stateRead) {
         if (firmwareType == 2) {
@@ -2525,6 +2575,7 @@ void Checks::checkSecureBoot()
         }
         return;
     }
+    Helper::logWrite("  [i] Secure Boot state source: " + std::string(stateSource));
 
     if (secbootStatus == 0x00000000) {
         Helper::printSuccess("- Secure-Boot is disabled (UEFI)", false);
@@ -2772,7 +2823,10 @@ void Checks::checkWinver()
         {26300, "Win11 26H2"}, {28000, "Win11 26H1"},
     };
     int min_build = 19041;
-    std::vector<int> trouble = {19045, 22621};
+    // v1.2.4 fix (user decision): 22H2 (Win10 19045 / Win11 22621) is NOT a 50/50 -
+    // supported; the 50/50 verdict starts with 25H2 (26200), 26H2 (26300) stays
+    // explicitly "(not supported)"
+    std::vector<int> trouble = {};
 
     // 25H2 and every build we do not know yet are 50/50: works for some users, breaks for others
     const int fiftyFiftyFrom = 26200;

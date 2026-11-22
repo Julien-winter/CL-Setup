@@ -17,7 +17,11 @@ The purpose of this program is to help the user setup the CL Client by doing all
 
 **Changed**
 - **Winver 26H2 is reported as "(not supported)"**: build 26300 now reads `- Winver "Win11 26H2" (not supported)` (still WARN) instead of the generic 50/50 wording - 25H2 and unknown future builds keep the 50/50 text
+- **Win10/Win11 22H2 is no longer a 50/50**: builds 19045 and 22621 are reported as supported (the trouble list is empty now) - the 50/50 verdict starts with 25H2 (26200)
 - **Loopback no longer listed**: `Loopback Pseudo-Interface 1` (Windows' own 127.0.0.1 interface, present on every system, not removable, no external traffic) is hidden from the adapter list and no longer counted in used/total or the summary
+
+**Fixed**
+- **Secure Boot "state unreadable" on UEFI systems**: when the `SecureBoot\State` registry key is missing (machines installed in legacy mode and later switched to UEFI, some OEM images) the check no longer gives up with `[-] UEFI boot detected but the Secure-Boot state could not be read` - it now reads the `SecureBoot` UEFI firmware variable directly (with `SeSystemEnvironmentPrivilege` enabled) and, if that fails too, asks PowerShell `Confirm-SecureBootUEFI`. Firmware that exposes no Secure-Boot variable at all is reported as OK (`Not supported by firmware`); the used source is written to the log
 
 ### v1.2.3
 
